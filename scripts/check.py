@@ -101,6 +101,17 @@ def check_schema():
     assert [r["p"] for r in rows] == ["urgent", "high", "medium", "low"]
 
 
+# ---- Task 3: auth ---------------------------------------------------------
+
+def check_password_hash_roundtrip():
+    from app.auth import hash_password, verify_password
+
+    h = hash_password("s3cret")
+    assert verify_password("s3cret", h)
+    assert not verify_password("wrong", h)
+    assert h != hash_password("s3cret"), "hashes must be salted"
+
+
 # ---- runner ---------------------------------------------------------------
 
 def main() -> int:
