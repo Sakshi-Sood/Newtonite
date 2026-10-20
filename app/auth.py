@@ -2,10 +2,12 @@
 import hashlib
 import hmac
 import secrets
+import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request, Response
-from pydantic import BaseModel
+from psycopg import Connection
+from pydantic import BaseModel, StringConstraints, model_validator
 
 from app.db import Conn
 from app.errors import AppError
@@ -53,6 +55,71 @@ User = Annotated[dict, Depends(current_user)]
 class LoginIn(BaseModel):
     email: str
     password: str
+
+
+Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
+Email = Annotated[str, StringConstraints(strip_whitespace=True, to_lower=True, max_length=254,
+                                         pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")]
+
+
+class SignupIn(BaseModel):
+    name: Name
+    email: Email
+    password: Annotated[str, StringConstraints(min_length=8, max_length=200)]
+    # Exactly one: join an existing team as member, or create a team and lead it.
+    team_id: uuid.UUID | None = None
+    new_team_name: Name | None = None
+
+    @model_validator(mode="after")
+    def _one_team_choice(self):
+        if (self.team_id is None) == (self.new_team_name is None):
+            raise ValueError("Choose a team to join or name a new team (not both).")
+        return self
+
+
+def signup(conn: Connection, data: SignupIn) -> dict:
+    """Create the account and its first team membership in one transaction.
+
+    Unique constraints decide races: two sign-ups with one email (or one new
+    team name) can't both succeed, and a failure leaves nothing half-created.
+    """
+    user = conn.execute(
+        """INSERT INTO users (email, name, password_hash) VALUES (%s, %s, %s)
+           ON CONFLICT (email) DO NOTHING RETURNING id, email, name""",
+        (data.email, data.name, hash_password(data.password)),
+    ).fetchone()
+    if user is None:
+        raise AppError(409, "EMAIL_TAKEN", "An account with this email already exists. Try signing in.")
+    if data.new_team_name:
+        team = conn.execute(
+            "INSERT INTO teams (name) VALUES (%s) ON CONFLICT (name) DO NOTHING RETURNING id",
+            (data.new_team_name,),
+        ).fetchone()
+        if team is None:
+            raise AppError(409, "TEAM_NAME_TAKEN", "A team with this name already exists. Join it instead.")
+        role = "lead"
+    else:
+        team = conn.execute("SELECT id FROM teams WHERE id = %s", (data.team_id,)).fetchone()
+        if team is None:
+            raise AppError(422, "INVALID_TEAM", "That team no longer exists.")
+        role = "member"
+    conn.execute("INSERT INTO memberships (user_id, team_id, role) VALUES (%s, %s, %s)",
+                 (user["id"], team["id"], role))
+    return user
+
+
+@router.post("/signup", status_code=201)
+def signup_route(body: SignupIn, request: Request, conn: Conn):
+    user = signup(conn, body)
+    request.session.clear()
+    request.session["user_id"] = str(user["id"])
+    return {"user": user}
+
+
+@router.get("/teams")
+def list_teams(conn: Conn):
+    """Team names for the sign-up form (no login needed)."""
+    return conn.execute("SELECT id, name FROM teams ORDER BY name").fetchall()
 
 
 @router.post("/login")

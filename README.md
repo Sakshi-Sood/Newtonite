@@ -43,7 +43,20 @@ psycopg 3 with plain SQL · plain HTML/CSS/JavaScript (no build step).
 
 Open <http://localhost:8000>. Interactive API docs are at <http://localhost:8000/docs>.
 
-### Demo accounts (password `password` for every account)
+### Creating accounts
+
+On the sign-in page choose **Create an account**. Enter your name, email and a
+password (8+ characters), then either:
+
+* **create a new team** — you become its **lead** (the first person in must do this), or
+* **join an existing team** — you become a **member**.
+
+You are signed in straight away. With an empty database, sign up once to create
+a team, then sign up a second person who joins it to try claiming, approving and
+editing the same item from two browsers.
+
+
+### Demo accounts (only after running the seed; password `password` for every account)
 
 | Email | Teams and roles | Good for trying |
 |---|---|---|
@@ -59,7 +72,7 @@ on the same Payments item: claim it at the same moment, or edit it at the same t
 
 ```bash
 .venv\Scripts\python -m unittest -v          # workflow + permission rules (no database)
-.venv\Scripts\python scripts\check.py        # 41 behaviour checks against the database
+.venv\Scripts\python scripts\check.py        # 47 behaviour checks against the database
 node tests/test_edits.mjs                    # edit/conflict merge rules (frontend, no deps)
 node tests/test_redirect.mjs                 # post-login redirect stays on this site
 ```
@@ -153,6 +166,8 @@ The overview tiles and the `view=` list filter use the same SQL:
 
 | Method | Path | Notes |
 |---|---|---|
+| POST | `/api/signup` | name, email, password + `team_id` (join as member) **or** `new_team_name` (create, as lead) |
+| GET | `/api/teams` | team names for the sign-up form (no login needed) |
 | POST | `/api/login`, `/api/logout` | session cookie |
 | GET | `/api/me` | user + teams with roles |
 | GET | `/api/teams/{id}/members` | assign picker |
@@ -175,8 +190,11 @@ Errors always look like `{"error": {"code", "message", "details"}}`.
   writes are refused, never applied, but you may see a change up to 10 s late.
 * **No notifications or background jobs.** The attention views are how people
   find what needs them; there is no email/Slack delivery.
-* **No admin screens.** Teams, users and memberships come from the seed script
-  (or SQL). No sign-up, password reset or SSO; login is email + password.
+* **Open sign-up.** Anyone who can reach the app can create an account and join
+  any team as a member (team names are listed on the sign-up page). There is no
+  email verification, invite or approval step, and no screen for adding a second
+  team or promoting someone to lead afterwards (SQL only).
+* No password reset or SSO; login is email + password.
 * **CSRF** protection relies on `SameSite=Lax` session cookies and JSON request
   bodies; there are no CSRF tokens.
 * **Page-number pagination.** If items change between page loads, a row can be
