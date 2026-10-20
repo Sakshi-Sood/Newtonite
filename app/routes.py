@@ -52,6 +52,29 @@ def add_comment(
                        lambda: (201, items.add_comment(conn, item_id, user["id"], body.body)))
 
 
+@router.post("/{item_id}/claim")
+def claim_item(item_id: str, request: Request, user: dict = Depends(current_user), conn: Connection = Depends(get_conn)):
+    return _idempotent(request, conn, user, None, lambda: (200, items.claim_item(conn, item_id, user["id"])))
+
+
+@router.post("/{item_id}/assign")
+def assign_item(
+    item_id: str, body: items.AssignIn, request: Request,
+    user: dict = Depends(current_user), conn: Connection = Depends(get_conn),
+):
+    return _idempotent(request, conn, user, body.model_dump(mode="json"), lambda: (
+        200, items.assign_item(conn, item_id, user["id"], body.assignee_id, body.expected_version)))
+
+
+@router.post("/{item_id}/transitions")
+def transition_item(
+    item_id: str, body: items.TransitionIn, request: Request,
+    user: dict = Depends(current_user), conn: Connection = Depends(get_conn),
+):
+    return _idempotent(request, conn, user, body.model_dump(mode="json"), lambda: (
+        200, items.transition_item(conn, item_id, user["id"], body.action, body.reason, body.expected_version)))
+
+
 @router.get("/{item_id}/activity")
 def get_activity(
     item_id: str,
