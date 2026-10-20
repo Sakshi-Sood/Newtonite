@@ -35,6 +35,23 @@ def get_item(item_id: str, user: dict = Depends(current_user), conn: Connection 
     return items.get_item(conn, item_id, user["id"])
 
 
+@router.patch("/{item_id}")
+def update_item(
+    item_id: str, body: items.ItemPatch,
+    user: dict = Depends(current_user), conn: Connection = Depends(get_conn),
+):
+    return items.update_item(conn, item_id, user["id"], body.expected_version, body.changes())
+
+
+@router.post("/{item_id}/comments", status_code=201)
+def add_comment(
+    item_id: str, body: items.CommentIn, request: Request,
+    user: dict = Depends(current_user), conn: Connection = Depends(get_conn),
+):
+    return _idempotent(request, conn, user, body.model_dump(mode="json"),
+                       lambda: (201, items.add_comment(conn, item_id, user["id"], body.body)))
+
+
 @router.get("/{item_id}/activity")
 def get_activity(
     item_id: str,

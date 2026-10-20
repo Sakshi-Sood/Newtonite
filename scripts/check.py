@@ -280,6 +280,76 @@ def check_concurrent_same_key_creates_one():
     assert sum(1 for _, _, replayed in results if not replayed) == 1
 
 
+# ---- Task 6: versioned edits, comments ------------------------------------
+
+def outcome(fn):
+    """('ok', result) or (error code, AppError) — for racing threads."""
+    from app.errors import AppError
+
+    try:
+        return "ok", fn()
+    except AppError as e:
+        return e.code, e
+
+
+def check_patch_bumps_version_and_logs_changed_fields_only():
+    from app.items import update_item
+
+    t = team()
+    m = user("member", t["id"])
+    it = create(m, t["id"], title="Old", priority="medium")
+    out = call(update_item, it["id"], m["id"], 1, {"title": "New", "priority": "medium"})
+    assert out["version"] == 2 and out["title"] == "New"
+    payload = sql("SELECT payload FROM activity WHERE work_item_id = %s AND kind = 'updated'", (it["id"],))[0]["payload"]
+    assert payload == {"changes": {"title": {"from": "Old", "to": "New"}}}, payload
+
+
+def check_patch_old_version_409_db_unchanged():
+    from app.items import update_item
+
+    t = team()
+    m = user("member", t["id"], name="First Editor")
+    it = create(m, t["id"], title="Original")
+    call(update_item, it["id"], m["id"], 1, {"title": "Second"})
+    err = expect_error(lambda: call(update_item, it["id"], m["id"], 1, {"title": "Stale write"}), 409, "STALE_VERSION")
+    assert err.details["current"]["version"] == 2 and err.details["current"]["title"] == "Second"
+    assert err.details["changed_by"] == "First Editor"
+    assert sql("SELECT title FROM work_items WHERE id = %s", (it["id"],))[0]["title"] == "Second"
+
+
+def check_concurrent_patches_same_version_one_wins():
+    from app.items import update_item
+
+    t = team()
+    a, b = user("member", t["id"]), user("member", t["id"])
+    it = create(a, t["id"])
+    with ThreadPoolExecutor(2) as ex:
+        results = list(ex.map(
+            lambda u: outcome(lambda: call(update_item, it["id"], u["id"], 1, {"title": f"by {u['id']}"})), [a, b]))
+    codes = sorted(code for code, _ in results)
+    assert codes == ["STALE_VERSION", "ok"], codes
+    assert sql("SELECT version FROM work_items WHERE id = %s", (it["id"],))[0]["version"] == 2
+
+
+def check_noop_patch_no_activity():
+    from app.items import update_item
+
+    t = team()
+    m = user("member", t["id"])
+    it = create(m, t["id"], title="Same")
+    out = call(update_item, it["id"], m["id"], 1, {"title": "Same"})
+    assert out["version"] == 1 and activity_kinds(it["id"]) == ["created"]
+
+
+def check_patch_cancelled_item_403():
+    from app.items import update_item
+
+    t = team()
+    m = user("member", t["id"])
+    it = item(m, t["id"], status="cancelled")
+    expect_error(lambda: call(update_item, it["id"], m["id"], 1, {"title": "x"}), 403, "FORBIDDEN")
+
+
 # ---- runner ---------------------------------------------------------------
 
 def main() -> int:

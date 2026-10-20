@@ -2,13 +2,13 @@
 change and its activity row commit (or roll back) together.
 """
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Annotated, Literal
 
 from fastapi.encoders import jsonable_encoder
 from psycopg import Connection
 from psycopg.types.json import Jsonb
-from pydantic import BaseModel, StringConstraints
+from pydantic import AfterValidator, BaseModel, StringConstraints, model_validator
 
 from app.errors import AppError
 from app.rules import ITEM_TYPES, PRIORITIES, allowed_actions, can
@@ -17,6 +17,9 @@ Title = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, ma
 Description = Annotated[str, StringConstraints(max_length=20000)]
 ItemType = Literal[ITEM_TYPES]
 Priority = Literal[PRIORITIES]
+# Times without a zone are taken as UTC, so they compare cleanly with stored timestamptz values.
+AwareDatetime = Annotated[datetime, AfterValidator(lambda d: d if d.tzinfo else d.replace(tzinfo=timezone.utc))]
+EDITABLE = ("title", "description", "priority", "due_at")
 
 
 class ItemCreate(BaseModel):
@@ -26,7 +29,32 @@ class ItemCreate(BaseModel):
     type: ItemType
     priority: Priority
     requires_approval: bool = False
-    due_at: datetime | None = None
+    due_at: AwareDatetime | None = None
+
+
+class ItemPatch(BaseModel):
+    expected_version: int
+    title: Title | None = None
+    description: Description | None = None
+    priority: Priority | None = None
+    due_at: AwareDatetime | None = None  # explicit null clears the due date
+
+    @model_validator(mode="after")
+    def _check(self):
+        sent = self.model_fields_set - {"expected_version"}
+        if not sent:
+            raise ValueError("Send at least one field to change.")
+        for field in ("title", "description", "priority"):
+            if field in sent and getattr(self, field) is None:
+                raise ValueError(f"{field} cannot be null.")
+        return self
+
+    def changes(self) -> dict:
+        return {f: getattr(self, f) for f in EDITABLE if f in self.model_fields_set}
+
+
+class CommentIn(BaseModel):
+    body: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=10000)]
 
 
 def _not_found() -> AppError:
@@ -128,6 +156,48 @@ def create_item(conn: Connection, user_id, data: ItemCreate) -> dict:
 def get_item(conn: Connection, item_id: str, user_id) -> dict:
     row, role = load_item(conn, item_id, user_id)
     return item_dto(conn, row, user_id, role)
+
+
+def stale_error(conn: Connection, item_id, user_id, role: str) -> AppError:
+    """409 carrying the item as it is now and who changed it last, so the client can show a diff."""
+    last = conn.execute(
+        """SELECT u.name FROM activity a JOIN users u ON u.id = a.actor_id
+           WHERE a.work_item_id = %s ORDER BY a.id DESC LIMIT 1""",
+        (item_id,),
+    ).fetchone()
+    return AppError(409, "STALE_VERSION", "This item was changed by someone else since you loaded it.",
+                    {"current": _fresh_dto(conn, item_id, user_id, role),
+                     "changed_by": last["name"] if last else None})
+
+
+def update_item(conn: Connection, item_id: str, user_id, expected_version: int, changes: dict) -> dict:
+    row, role = load_item(conn, item_id, user_id)
+    require(row, user_id, role, "edit")
+    diffs = {f: {"from": row[f], "to": v} for f, v in changes.items() if f in EDITABLE and row[f] != v}
+    if not diffs:
+        return item_dto(conn, row, user_id, role)
+    sets = ", ".join(f"{f} = %s" for f in diffs)  # field names come from EDITABLE only
+    updated = conn.execute(
+        f"""UPDATE work_items SET {sets}, version = version + 1, updated_at = now()
+            WHERE id = %s AND version = %s RETURNING *""",
+        (*[d["to"] for d in diffs.values()], row["id"], expected_version),
+    ).fetchone()
+    if updated is None:
+        raise stale_error(conn, row["id"], user_id, role)
+    record_activity(conn, row["id"], user_id, "updated", {"changes": diffs})
+    return _fresh_dto(conn, row["id"], user_id, role)
+
+
+def add_comment(conn: Connection, item_id: str, user_id, body: str) -> dict:
+    row, role = load_item(conn, item_id, user_id)
+    require(row, user_id, role, "comment")
+    activity_id = record_activity(conn, row["id"], user_id, "comment", {"body": body})
+    entry = conn.execute(
+        """SELECT a.id, a.kind, a.payload, a.created_at, u.id AS actor_id, u.name AS actor_name
+           FROM activity a JOIN users u ON u.id = a.actor_id WHERE a.id = %s""",
+        (activity_id,),
+    ).fetchone()
+    return _entry(entry)
 
 
 def _entry(row: dict) -> dict:
