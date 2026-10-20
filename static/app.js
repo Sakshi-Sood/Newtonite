@@ -4,6 +4,7 @@
 
 import { changedFields, conflictRows } from "./edits.js";
 import { safeNext } from "./redirect.js";
+import { latest } from "./state.js";
 
 // ---------------------------------------------------------------- API ----
 
@@ -365,6 +366,8 @@ async function initItem() {
   async function refresh() {
     try {
       const fresh = await api("GET", `/api/items/${encodeURIComponent(id)}`);
+      // An older copy (a poll that raced a save) must never replace newer state.
+      if (latest(item, fresh) !== fresh) return;
       const changed = !item || fresh.version !== item.version || fresh.last_activity_at !== item.last_activity_at;
       item = fresh;
       $("#item-root").hidden = false;
@@ -372,7 +375,7 @@ async function initItem() {
       render();
       if (editing && item.version > editing.baseVersion) {
         $("#banner").hidden = false;
-        $("#banner").textContent = "Someone else changed this item while you were editing. Saving will show you both versions.";
+        $("#banner").textContent = "This item changed while you were editing. Saving will show you both versions.";
       }
       if (changed) loadTimeline();
     } catch (err) {
@@ -427,7 +430,7 @@ async function initItem() {
         can("claim") ? el("button", { type: "button", class: "primary", onclick: (ev) => claim(ev.target) }, "Claim") : null,
         can("edit") && !editing ? el("button", { type: "button", onclick: openEditor }, "Edit") : null,
         ...actions),
-      assignPicker ? el("div", { class: "actions" }, assignPicker) : null,
+      ...(assignPicker ? [el("div", { class: "actions" }, assignPicker)] : []),
     );
   }
 
@@ -586,7 +589,9 @@ async function initItem() {
       el("tr", {}, el("th", {}, label(r.field)), el("td", {}, String(r.mine ?? "—")), el("td", {}, String(r.current ?? "—"))));
     $("#banner").hidden = true;
     $("#conflict").replaceChildren(el("div", { class: "conflict" },
-      el("strong", {}, `${changed_by || "Someone"} changed this item while you were editing.`),
+      el("strong", {}, changed_by && changed_by.id === me.user.id
+        ? "You changed this item somewhere else (another tab or window) while this editor was open."
+        : `${changed_by ? changed_by.name : "Someone"} changed this item while you were editing.`),
       rows.length
         ? el("table", {}, el("tr", {}, el("th", {}, "Field"), el("th", {}, "Yours"), el("th", {}, "Current")), rows)
         : el("p", {}, "Your edits don't conflict with theirs."),
