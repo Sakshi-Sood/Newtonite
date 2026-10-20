@@ -1,8 +1,8 @@
 """Connection pool and the per-request connection dependency."""
 from pathlib import Path
-from typing import Iterator
+from typing import Annotated, Iterator
 
-from fastapi import Request
+from fastapi import Depends, Request
 from psycopg import Connection
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
@@ -24,6 +24,13 @@ def get_conn(request: Request) -> Iterator[Connection]:
     """
     with request.app.state.pool.connection() as conn:
         yield conn
+
+
+# scope="function": commit as soon as the endpoint returns, *before* the
+# response is sent. (The default "request" scope commits after sending, so a
+# client could be told "done" and then read the old state.) Use this alias
+# everywhere so one request shares one connection and one transaction.
+Conn = Annotated[Connection, Depends(get_conn, scope="function")]
 
 
 def apply_schema(conn: Connection) -> None:

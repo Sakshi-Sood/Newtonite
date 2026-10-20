@@ -2,12 +2,12 @@
 import hashlib
 import hmac
 import secrets
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request, Response
-from psycopg import Connection
 from pydantic import BaseModel
 
-from app.db import get_conn
+from app.db import Conn
 from app.errors import AppError
 
 router = APIRouter(prefix="/api")
@@ -36,7 +36,7 @@ def verify_password(pw: str, stored: str) -> bool:
 _DUMMY_HASH = hash_password(secrets.token_hex(8))
 
 
-def current_user(request: Request, conn: Connection = Depends(get_conn)) -> dict:
+def current_user(request: Request, conn: Conn) -> dict:
     user_id = request.session.get("user_id")
     if not user_id:
         raise AppError(401, "UNAUTHENTICATED", "Please log in.")
@@ -47,13 +47,16 @@ def current_user(request: Request, conn: Connection = Depends(get_conn)) -> dict
     return row
 
 
+User = Annotated[dict, Depends(current_user)]
+
+
 class LoginIn(BaseModel):
     email: str
     password: str
 
 
 @router.post("/login")
-def login(body: LoginIn, request: Request, conn: Connection = Depends(get_conn)):
+def login(body: LoginIn, request: Request, conn: Conn):
     row = conn.execute(
         "SELECT id, email, name, password_hash FROM users WHERE lower(email) = lower(%s)",
         (body.email.strip(),),
@@ -73,7 +76,7 @@ def logout(request: Request):
 
 
 @router.get("/me")
-def me(user: dict = Depends(current_user), conn: Connection = Depends(get_conn)):
+def me(user: User, conn: Conn):
     teams = conn.execute(
         """SELECT t.id, t.name, m.role FROM memberships m JOIN teams t ON t.id = m.team_id
            WHERE m.user_id = %s ORDER BY t.name""",
@@ -83,7 +86,7 @@ def me(user: dict = Depends(current_user), conn: Connection = Depends(get_conn))
 
 
 @router.get("/teams/{team_id}/members")
-def team_members(team_id: str, user: dict = Depends(current_user), conn: Connection = Depends(get_conn)):
+def team_members(team_id: str, user: User, conn: Conn):
     member = conn.execute(
         "SELECT 1 FROM memberships WHERE user_id = %s AND team_id::text = %s", (user["id"], team_id)
     ).fetchone()

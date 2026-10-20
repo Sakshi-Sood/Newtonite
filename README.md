@@ -59,7 +59,9 @@ on the same Payments item: claim it at the same moment, or edit it at the same t
 
 ```bash
 .venv\Scripts\python -m unittest -v          # workflow + permission rules (no database)
-.venv\Scripts\python scripts\check.py        # 40 behaviour checks against the database
+.venv\Scripts\python scripts\check.py        # 41 behaviour checks against the database
+node tests/test_edits.mjs                    # edit/conflict merge rules (frontend, no deps)
+node tests/test_redirect.mjs                 # post-login redirect stays on this site
 ```
 
 `scripts/check.py` runs against the configured database but creates its own

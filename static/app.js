@@ -2,6 +2,9 @@
 // Server state is fetched per page; the URL holds filter state; every
 // mutation carries an Idempotency-Key so a retry can never act twice.
 
+import { changedFields, conflictRows } from "./edits.js";
+import { safeNext } from "./redirect.js";
+
 // ---------------------------------------------------------------- API ----
 
 export class ApiError extends Error {
@@ -145,9 +148,7 @@ async function initLogin() {
     await busy(form.querySelector("button"), async () => {
       try {
         await api("POST", "/api/login", data);
-        const next = new URLSearchParams(location.search).get("next");
-        // Only same-site paths, never "//other.host".
-        location.href = next && next.startsWith("/") && !next.startsWith("//") ? next : "/";
+        location.href = safeNext(new URLSearchParams(location.search).get("next"), location.origin);
       } catch (err) {
         showError($("#login-error"), err);
       }
@@ -187,7 +188,11 @@ async function initOverview() {
 
   function syncForm() {
     const p = params();
-    for (const f of FIELDS) form.elements[f].value = p.get(f) || "";
+    for (const f of FIELDS) {
+      // Don't rewrite the search box while the user is typing in it (it would eat spaces).
+      if (f === "q" && document.activeElement === form.elements.q) continue;
+      form.elements[f].value = p.get(f) || "";
+    }
   }
 
   async function loadTiles() {
@@ -466,7 +471,6 @@ async function initItem() {
   }
 
   // ---- editing with stale-write protection ----
-  const EDIT_FIELDS = ["title", "description", "priority", "due_at"];
   const toLocalInput = (iso) => {
     if (!iso) return "";
     const d = new Date(iso);
@@ -491,6 +495,7 @@ async function initItem() {
     form.addEventListener("submit", (ev) => { ev.preventDefault(); save(editing.baseVersion); });
     $("#editor").replaceChildren(form);
     $("#editor").hidden = false;
+    editing.snapshot = draft(); // what the form showed when editing began
     render();
   }
 
@@ -515,8 +520,10 @@ async function initItem() {
   async function save(expectedVersion) {
     const button = $("#edit-form button[type=submit]");
     await busy(button, async () => {
+      const changes = changedFields(editing.snapshot, draft());
+      if (Object.keys(changes).length === 0) { closeEditor(); flash("Nothing to save.", true); return; }
       try {
-        item = await api("PATCH", `/api/items/${id}`, { expected_version: expectedVersion, ...draft() });
+        item = await api("PATCH", `/api/items/${id}`, { expected_version: expectedVersion, ...changes });
         closeEditor();
         flash("Saved.", true);
         loadTimeline();
@@ -531,12 +538,9 @@ async function initItem() {
   function showConflict({ current, changed_by }) {
     item = current;
     renderMeta();
-    const mine = draft();
-    const same = (f) => f === "due_at"
-      ? (mine.due_at ? new Date(mine.due_at).getTime() : null) === (current.due_at ? new Date(current.due_at).getTime() : null)
-      : mine[f] === current[f];
-    const rows = EDIT_FIELDS.filter((f) => !same(f)).map((f) =>
-      el("tr", {}, el("th", {}, label(f)), el("td", {}, String(mine[f] ?? "—")), el("td", {}, String(current[f] ?? "—"))));
+    // Only fields I changed matter; everything else keeps their version.
+    const rows = conflictRows(changedFields(editing.snapshot, draft()), current).map((r) =>
+      el("tr", {}, el("th", {}, label(r.field)), el("td", {}, String(r.mine ?? "—")), el("td", {}, String(r.current ?? "—"))));
     $("#banner").hidden = true;
     $("#conflict").replaceChildren(el("div", { class: "conflict" },
       el("strong", {}, `${changed_by || "Someone"} changed this item while you were editing.`),
