@@ -14,26 +14,44 @@
     <h1 class="sr-only">Board</h1>
     <div id="live-banner" class="banner" hidden></div>
     <div id="flash" class="flash" hidden></div>
-    <div class="chips" role="toolbar" aria-label="Quick filters">
+    <div id="board-tools" class="chips" role="toolbar" aria-label="Quick filters">
+      <select id="board-team" aria-label="Team"></select>
       <button type="button" class="chip" data-chip="mine" aria-pressed="false">My tasks</button>
       <button type="button" class="chip" data-chip="unassigned" aria-pressed="false">Unassigned</button>
       <button type="button" class="chip" data-chip="urgent" aria-pressed="false">Urgent &amp; high</button>
       <button type="button" class="chip" data-chip="overdue" aria-pressed="false">Overdue</button>
-      <button type="button" class="chip" data-chip="requested" aria-pressed="false">Requested by me</button>
-      <select id="board-team" aria-label="Team"><option value="">All my teams</option></select>
       <input id="board-q" class="search" type="search" placeholder="Search the board" aria-label="Search the board">
+      <button type="button" id="manage-statuses" hidden>Manage statuses</button>
       <details class="help">
         <summary>How it works</summary>
         <div class="help-body">
-          <p>Drag a card to another column to change its status. While you drag, columns it can't move to fade out.</p>
+          <p>Drag a card to another column to change its status. You can drag any task you're assigned to, or any task if you're a team lead.</p>
           <p>Every card also has a status dropdown, which works with a keyboard or on a phone.</p>
-          <p>Done and Cancelled are folded to save room. Click one to open it. You can still drop cards on them while folded.</p>
+          <p>Statuses that count as finished start folded. Click a folded column to open it; you can still drop cards on it.</p>
+          <p>Tasks waiting for a lead's approval can't be moved until they're approved.</p>
         </div>
       </details>
     </div>
     <p id="board-error" class="error" hidden></p>
     <div id="board" class="board"></div>
   </main>
+
+  <dialog id="status-dialog" aria-labelledby="status-title">
+    <div class="dialog-head">
+      <h2 id="status-title">Statuses for <span id="status-team"></span></h2>
+      <button type="button" id="status-close" aria-label="Close">Close</button>
+    </div>
+    <p class="muted">These are the board's columns. To do, In progress and Completed are fixed; add your own, rename them,
+      pick colours and reorder them. A status that <em>counts as finished</em> takes its tasks out of Overdue and Assigned to me.</p>
+    <p id="status-error" class="error" hidden></p>
+    <ul id="status-list" class="status-list"></ul>
+    <form id="status-add" class="status-add">
+      <input name="name" maxlength="40" required placeholder="New status, e.g. In review" aria-label="New status name">
+      <select name="color" aria-label="Colour"></select>
+      <label class="check"><input name="finished" type="checkbox"> Counts as finished</label>
+      <button type="submit" class="primary">Add status</button>
+    </form>
+  </dialog>
   <script type="module" src="/app.js"></script>
 </body>
 </html>

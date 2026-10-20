@@ -10,7 +10,7 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
 
-from app import auth, events, routes
+from app import admin_routes, auth, events, profile, routes, status_routes
 from app.config import DATABASE_URL, SECRET_KEY
 from app.db import create_pool
 from app.errors import install_handlers
@@ -35,6 +35,9 @@ def create_app() -> FastAPI:
     app.include_router(auth.router)
     app.include_router(routes.router)
     app.include_router(routes.overview_router)
+    app.include_router(status_routes.router)
+    app.include_router(profile.router)
+    app.include_router(admin_routes.router)
     app.include_router(events.router)
     # Static frontend last, so /api routes take precedence.
     app.mount("/", StaticFiles(directory=STATIC_DIR, html=True, check_dir=False), name="static")

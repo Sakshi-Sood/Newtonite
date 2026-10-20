@@ -1,54 +1,67 @@
-"""Pure workflow/permission rules: python -m unittest -v"""
+"""Pure permission rules: python -m unittest -v"""
 import unittest
 
-from app.rules import allowed_actions, can, next_status
+from app.rules import allowed_actions, can
 
-ITEM = {"status": "in_progress", "assignee_id": "u2", "created_by": "u3"}
+# assignee u2, creator u3, in a status that isn't finished
+ITEM = {"closed": False, "approval": None, "assignee_id": "u2", "created_by": "u3"}
 
 
 class RulesTest(unittest.TestCase):
-    def test_transitions(self):
-        self.assertEqual(next_status("open", "start"), "in_progress")
-        self.assertIsNone(next_status("done", "cancel"))
-        self.assertIsNone(next_status("awaiting_approval", "start"))
-
     def test_non_member_gets_nothing(self):
         self.assertEqual(allowed_actions(ITEM, "u1", None), [])
 
-    def test_member_only_completes_own_item(self):
-        self.assertFalse(can(ITEM, "u1", "member", "complete"))
-        self.assertTrue(can(ITEM, "u2", "member", "complete"))
+    def test_member_only_moves_own_item(self):
+        self.assertFalse(can(ITEM, "u1", "member", "move"))
+        self.assertTrue(can(ITEM, "u2", "member", "move"))
 
-    def test_lead_can_complete_any_and_assign(self):
-        self.assertTrue(can(ITEM, "u1", "lead", "complete") and can(ITEM, "u1", "lead", "assign"))
+    def test_lead_can_move_and_assign_any(self):
+        self.assertTrue(can(ITEM, "u1", "lead", "move") and can(ITEM, "u1", "lead", "assign"))
 
-    def test_member_cannot_assign_or_cancel(self):
-        self.assertFalse(can(ITEM, "u2", "member", "assign") or can(ITEM, "u2", "member", "cancel"))
+    def test_member_cannot_assign(self):
+        self.assertFalse(can(ITEM, "u2", "member", "assign"))
 
-    def test_creator_cannot_approve_own_item(self):
-        item = {"status": "awaiting_approval", "assignee_id": None, "created_by": "u1"}
-        self.assertFalse(can(item, "u1", "lead", "approve"))
-        self.assertTrue(can(item, "u9", "lead", "approve"))
-
-    def test_terminal_allows_comment_only(self):
-        acts = allowed_actions({"status": "cancelled", "assignee_id": None, "created_by": "u3"}, "u1", "lead")
+    def test_closed_item_allows_comment_and_reopening_only(self):
+        closed = {**ITEM, "closed": True}
+        acts = allowed_actions(closed, "u2", "member")
         self.assertIn("comment", acts)
+        self.assertIn("move", acts)  # the assignee can move it back out of a finished status
         self.assertNotIn("edit", acts)
         self.assertNotIn("claim", acts)
+        self.assertNotIn("assign", allowed_actions({**closed, "assignee_id": None}, "u1", "lead"))
 
     def test_claim_only_when_unassigned(self):
         self.assertFalse(can(ITEM, "u1", "member", "claim"))
+        self.assertTrue(can({**ITEM, "assignee_id": None}, "u1", "member", "claim"))
+
+    def test_pending_approval_blocks_status_changes_for_everyone(self):
+        pending = {**ITEM, "approval": "pending"}
+        self.assertFalse(can(pending, "u2", "member", "move"))
+        self.assertFalse(can(pending, "u9", "lead", "move"))
+        self.assertTrue(can({**ITEM, "approval": "approved"}, "u2", "member", "move"))
+
+    def test_approval_is_a_leads_call_and_never_the_creators(self):
+        pending = {**ITEM, "approval": "pending"}
+        self.assertTrue(can(pending, "u9", "lead", "approve") and can(pending, "u9", "lead", "reject"))
+        self.assertFalse(can(pending, "u3", "lead", "approve"))  # creator, even as lead
+        self.assertFalse(can(pending, "u2", "member", "approve"))
+        self.assertFalse(can(ITEM, "u9", "lead", "approve"))  # nothing to approve
+
+    def test_a_rejected_task_is_closed_but_a_lead_can_still_approve_it(self):
+        rejected = {**ITEM, "approval": "rejected", "closed": True}
+        self.assertTrue(can(rejected, "u9", "lead", "approve"))
+        self.assertFalse(can(rejected, "u9", "lead", "reject"))
+        self.assertFalse(can(rejected, "u2", "member", "move"))
 
     def test_restricted_item_details_only_for_leads_and_creator(self):
-        item = {**ITEM, "restricted": True}  # assignee u2, creator u3
+        item = {**ITEM, "restricted": True}
         self.assertFalse(can(item, "u2", "member", "edit"))  # assignee member: no
         self.assertTrue(can(item, "u3", "member", "edit"))   # creator: yes
         self.assertTrue(can(item, "u9", "lead", "edit"))     # lead: yes
         self.assertTrue(can({**ITEM, "restricted": False}, "u2", "member", "edit"))
 
     def test_restriction_does_not_lock_status(self):
-        item = {**ITEM, "restricted": True}
-        self.assertTrue(can(item, "u2", "member", "complete"))
+        self.assertTrue(can({**ITEM, "restricted": True}, "u2", "member", "move"))
 
     def test_only_a_non_lead_creator_toggles_restriction(self):
         self.assertFalse(can(ITEM, "u2", "member", "restrict"))
@@ -65,8 +78,9 @@ class RulesTest(unittest.TestCase):
     def test_requester_views_comments_edits_but_does_no_work(self):
         acts = allowed_actions({**ITEM, "restricted": True, "created_by": "r1"}, "r1", "requester")
         self.assertEqual(acts, ["view", "edit", "comment", "restrict"])
-        unassigned = {"status": "open", "assignee_id": None, "created_by": "r1"}
+        unassigned = {**ITEM, "assignee_id": None, "created_by": "r1"}
         self.assertNotIn("claim", allowed_actions(unassigned, "r1", "requester"))
+        self.assertNotIn("move", allowed_actions(unassigned, "r1", "requester"))
 
 
 if __name__ == "__main__":

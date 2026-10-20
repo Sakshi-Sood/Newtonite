@@ -38,30 +38,76 @@ psycopg 3 with plain SQL · plain HTML/CSS/JavaScript (no build step).
 ## Run
 
 ```bash
-.venv\Scripts\python -m app.migrate     # once, after pulling changes: adds new columns, keeps your data
+.venv\Scripts\python -m app.migrate     # once, after pulling changes: keeps your data (see below)
 .venv\Scripts\python -m uvicorn app.main:app --reload --timeout-graceful-shutdown 3
 ```
 
 Open <http://localhost:8000>. Interactive API docs are at <http://localhost:8000/docs>.
 
-### Creating accounts
+### Upgrading an existing database
 
-On the sign-in page choose **Create an account**. Enter your name, email and a
-password (8+ characters), then either:
+`python -m app.migrate` is safe to run any number of times. The first time after
+this change it converts the six old fixed statuses into per-team statuses:
+open → To do, in progress → In progress, done → Completed, awaiting approval →
+To do with approval pending, and **Blocked** / **Cancelled** become custom statuses
+(Cancelled counts as finished) in teams that had such tasks. Take a backup first
+if the data matters (`pg_dump`).
 
-* **create a new team** — you become its **lead** (the first person in must do this), or
-* **join an existing team** — you become a **member**.
+### Accounts and admins
 
-You are signed in straight away. With an empty database, sign up once to create
-a team, then sign up a second person who joins it to try claiming, approving and
-editing the same item from two browsers.
+There is **no public sign-up**. Everyone's account is created by an **admin**.
 
+* **First run (empty database):** opening the app shows a one-time
+  **Create the first admin** page. That admin then creates teams and everyone else.
+  The page closes itself once an account exists.
+* **Existing database with users** (the setup page only appears on an empty one):
+  make one of your users an admin from the command line.
+
+  ```bash
+  .venv\Scripts\python -m app.create_admin                      # list users and who is an admin
+  .venv\Scripts\python -m app.create_admin --email you@mail.com # make that user an admin
+  .venv\Scripts\python -m app.create_admin --email new@mail.com --name "New Person"   # create an admin (asks for a password)
+  ```
+
+  This is also the way back in if the last admin is ever locked out.
+* **Adding people:** admins open **Admin** in the header, then **Users → New user**:
+  name, email, a **temporary password** (there's a Generate button) and the teams
+  the person joins, each as member or lead. The dialog then shows the sign-in
+  details to pass on. **The new person must choose their own password the first
+  time they sign in**, and can't use the app until they do. Admins can reset a
+  forgotten password the same way.
+
+### The admin dashboard
+
+**Admin** appears in the header for admins only; the server refuses every
+`/api/admin/*` request from anyone else (and `/admin.html` shows "Only admins can
+open this page").
+
+| Tab | What an admin can do |
+|---|---|
+| **Teams** | Create teams (each gets the three default statuses), rename them, delete them (type the team's name to confirm; this deletes its tasks too), and open **Members** to add people, change roles or remove them. |
+| **Users** | Search users, create them, edit name and email, make someone an admin or take it away, **deactivate** or reactivate an account, reset a password, and add the user to teams or remove them. |
+
+Rules the server enforces:
+
+* A team that has members always has **at least one lead**: you can't demote or
+  remove the last lead, and the first person added to an empty team must be a lead.
+* The **last active admin** can't be demoted or deactivated, and nobody can
+  deactivate themselves.
+* A **deactivated** user is locked out immediately (their open sessions stop
+  working), keeps their history, and can't be assigned work.
+* Removing someone from a team **unassigns their tasks** in it, each with a
+  history entry.
+* Being an admin doesn't give access to tasks: an admin works on tasks only in
+  teams they are a member of (they can add themselves). An admin in no team lands
+  on the dashboard after signing in.
 
 ### Demo accounts (only after running the seed; password `password` for every account)
 
 | Email | Teams and roles | Good for trying |
 |---|---|---|
-| `lead@newtonite.test` | Payments **lead**, Platform **lead** | approving, assigning, cancelling |
+| `admin@newtonite.test` | no team, **admin** | the admin dashboard: teams, users, membership |
+| `lead@newtonite.test` | Payments **lead**, Platform **lead** | approving, assigning, managing statuses |
 | `lead2@newtonite.test` | Payments **lead** | approving items `lead@` created |
 | `member@newtonite.test` | Payments member, Platform member | claiming, working items |
 | `outsider@newtonite.test` | Support member | seeing that other teams' items are invisible |
@@ -73,7 +119,7 @@ on the same Payments item: claim it at the same moment, or edit it at the same t
 
 ```bash
 .venv\Scripts\python -m unittest -v          # workflow + permission rules (no database)
-.venv\Scripts\python scripts\check.py        # 59 behaviour checks against the database
+.venv\Scripts\python scripts\check.py        # 74 behaviour checks against the database
 node tests/test_edits.mjs                    # edit/conflict merge rules (frontend, no deps)
 node tests/test_redirect.mjs                 # post-login redirect stays on this site
 node tests/test_state.mjs                    # an older server response never replaces newer state
@@ -110,31 +156,35 @@ attention views. Add `-v` for tracebacks.
 Every request runs in **one database transaction**: the change, its activity
 row and its idempotency record commit together or not at all.
 
-### Workflow
+### Statuses
 
-```
-awaiting_approval ──approve──▶ open ──start──▶ in_progress ──complete──▶ done
-        │                                       │      ▲                   │
-      reject                                  block  unblock            reopen
-        ▼                                       ▼      │                   │
-    cancelled                                  blocked ┘    (back to in_progress)
+Every team has its own board columns (statuses):
 
-cancel: open | in_progress | blocked ──▶ cancelled
-```
+* Three **defaults** that can't be renamed or deleted: **To do**, **In progress**
+  and **Completed** (Completed counts as finished).
+* Any number of **custom** statuses. Team **leads** add, rename, recolour,
+  reorder and delete them with **Manage statuses** on the board. Members can read them.
+* A status can be marked **counts as finished**. Tasks in a finished status can't
+  be edited, claimed or reassigned, and drop out of *Assigned to me*, *Overdue*
+  and *No activity*.
+* Deleting a custom status that still has tasks asks where they should go; each
+  moved task gets a history entry.
+* A new task starts in **To do**. If you move a task to another team it keeps its
+  place: same default status, or the custom status with the same name, otherwise To do.
 
-| Action | From | To | Needs |
-|---|---|---|---|
-| approve / reject | awaiting_approval | open / cancelled | a lead who didn't create it; reject needs a reason |
-| start | open | in_progress | an assignee |
-| block / unblock | in_progress ↔ blocked | | block needs a reason |
-| complete | in_progress | done | a reason (resolution note) |
-| reopen | done | in_progress | |
-| cancel | open, in_progress, blocked | cancelled | a lead, and a reason |
+**Moving a task:** the assignee, or any lead of the team, can move it to *any*
+status of its team, in any order, by drag and drop or the status dropdown. There
+are no required reasons.
 
-* Items flagged "needs approval" start in `awaiting_approval`; others start `open`.
-* `start` needs an assignee. `reject`, `block`, `complete` and `cancel` need a
-  reason, which is kept in the history ("why was this decided?").
-* `done` and `cancelled` are final (a `done` item can be reopened).
+### Approval
+
+Ticking *Needs a lead's approval* when creating a task adds an approval step:
+
+* Until a lead approves it, **nobody can change its status** (it stays in To do).
+* A lead approves or rejects it from the task page. **The task's creator can never
+  approve or reject their own task**, even if they're a lead.
+* A **rejected** task is closed and locked, but another lead can still approve it later.
+* *Awaiting my approval* on the List page lists the pending tasks in teams you lead.
 
 ### Who can do what
 
@@ -148,10 +198,10 @@ team and a member in another.
 | Edit details, move to another team | | ✓ | ✓ unless **restricted** | ✓ |
 | Tick / untick "Restrict editing" | | ✓ (they're the creator) | only the creator | ✗ (leads can always edit, so they don't get the option) |
 | Claim an unassigned item | | | ✓ | ✓ |
-| Start / block / unblock / complete / reopen | | | only if assigned to them | ✓ any item |
+| Change status (any status of the team) | | | only if assigned to them | ✓ any task |
 | Assign when creating | | | ✓ anyone in the team | ✓ anyone in the team |
 | Reassign later | | | only if **they** made the current assignment | ✓ |
-| Cancel | | | | ✓ |
+| Manage the team's statuses | | | | ✓ |
 | Approve / reject | | | | ✓, **but never their own item** |
 
 * **Restrict editing** (a checkbox on create and edit, shown to a creator who isn't
@@ -169,7 +219,8 @@ team and a member in another.
   didn't create the task, it leaves your list.
 
 The server enforces all of this on every request. The UI only shows the
-buttons the server lists in `allowed_actions`.
+buttons the server lists in `allowed_actions`. Admins (see above) manage teams,
+users and membership, but have no extra rights over tasks.
 
 ### What "needs attention" means
 
@@ -185,44 +236,74 @@ The overview tiles and the `view=` list filter use the same SQL:
 ### List and board
 
 The header has two views of the same tasks: **List** (attention tiles, filters,
-and a status dropdown on every row) and **Board** (one column per status). On
-the board, drag a card to another column to change its status. While you drag,
-columns the card can't move to fade out, and moves that need a reason (block,
-complete, cancel, reject) ask for one. Every card also has the same status
-dropdown, for keyboard and touch use. Quick filter chips: *My tasks*,
-*Unassigned*, *Urgent & high*, *Overdue*, *Requested by me*, plus team and
-search. Columns load 25 cards at a time, and their counts come from the database.
+and a status dropdown on every row) and **Board** (one column per status).
+
+* **Drag and drop:** drag a card to another column to change its status. Every
+  card also has a status dropdown, for keyboard and touch use.
+* **One team at a time:** each team has its own statuses, so the board has a team
+  picker. Leads of the team also see **Manage statuses**.
+* **Fixed width, scrolls sideways:** columns have a fixed width, so a board with
+  many statuses scrolls sideways, and cards keep their width when other columns fold.
+* **Folding:** a folded column shows only its name and count, and you can still
+  drop cards on it. Finished statuses start folded; click a column to open it or
+  use its ‹ button to fold it. The browser remembers your choice.
+* **Quick filters:** *My tasks*, *Unassigned*, *Urgent & high*, *Overdue*, plus search.
+  Columns load 25 cards at a time, and their counts come from the database.
+
+### Profile
+
+Click your name in the header. The profile page shows your account (name, email),
+a summary of your work (assigned to you, overdue, finished by you, created by you),
+and each team you're in with your role, its members and its task counts. You can
+change your display name and your password (the current password is required).
 
 ### Live updates
 
-Pages never refresh on their own. When someone else changes a task you can see,
-the server pushes a small notice (Server-Sent Events). The page then shows
-*"3 tasks have changed since you loaded this board" · Refresh* (one task changed
-several times counts once) and reloads only when you click. The **Refresh** button in the header works at any time. The dot
-next to it shows whether the live connection is up. After the connection drops
-and comes back, the page tells you that you may have missed changes. Saving
-over someone else's newer change is still refused, as before (`STALE_VERSION`).
+Pages never refresh on their own. When someone else changes a task you can see (or
+a lead changes your team's statuses), the server pushes a small notice
+(Server-Sent Events). The page then shows *"3 tasks have changed since you loaded
+this board" · Refresh* (one task changed several times counts once) and reloads
+only when you click. The **Refresh** button in the header works at any time. After
+the connection drops and comes back, the page tells you that you may have missed
+changes. Saving over someone else's newer change is still refused (`STALE_VERSION`).
 
 ## API summary
 
 | Method | Path | Notes |
 |---|---|---|
-| POST | `/api/signup` | name, email, password + `team_id` (join as member) **or** `new_team_name` (create, as lead) |
-| GET | `/api/teams` | team names for the sign-up form (no login needed) |
+| GET / POST | `/api/setup` | first-run only: is setup needed? / create the first admin (409 once any user exists) |
+| GET | `/api/teams` | team names, for choosing where to send a task (login required) |
 | POST | `/api/login`, `/api/logout` | session cookie |
-| GET | `/api/me` | user + teams with roles |
+| GET | `/api/me` | user (incl. `is_admin`, `must_change_password`) + teams with roles and statuses |
 | GET | `/api/teams/{id}/members` | assign picker |
 | GET | `/api/overview` | attention counts |
-| GET | `/api/items` | `view, team_id, status, priority, type, assignee(me\|unassigned\|id), q, sort(priority\|updated\|created), page, page_size≤100` |
+| GET | `/api/items` | `view, team_id, status (name), status_id, priority, type, assignee(me\|unassigned\|id), q, sort(priority\|updated\|created), page, page_size≤100` |
 | POST | `/api/items` | create (any team; optional `assignee_id`, `restricted`) · **Idempotency-Key required** |
 | GET | `/api/items/{id}` | includes `version` and `allowed_actions` |
 | PATCH | `/api/items/{id}` | details, `restricted`, `team_id` (move), `assignee_id` · `expected_version` required → 409 `STALE_VERSION` if outdated |
 | POST | `/api/items/{id}/claim` | 409 `ALREADY_CLAIMED` names the owner · Idempotency-Key |
 | POST | `/api/items/{id}/assign` | lead only · `expected_version` · Idempotency-Key |
-| POST | `/api/items/{id}/transitions` | `{action, reason?, expected_version}` · Idempotency-Key |
+| POST | `/api/items/{id}/status` | `{status_id, expected_version}` · assignee or lead · Idempotency-Key |
+| POST | `/api/items/{id}/approval` | `{decision: approve\|reject, reason?, expected_version}` · a lead who isn't the creator · Idempotency-Key |
+| GET | `/api/teams/{id}/statuses` | the team's statuses, in board order |
+| POST | `/api/teams/{id}/statuses` | `{name, color, finished}` · leads only |
+| PATCH | `/api/teams/{id}/statuses/{sid}` | rename, recolour, `finished` · leads only (defaults: colour only) |
+| PUT | `/api/teams/{id}/statuses/order` | `{ids: [...]}` every status once · leads only |
+| DELETE | `/api/teams/{id}/statuses/{sid}?move_to=` | custom only; `move_to` required if it has tasks (409 `STATUS_IN_USE`) |
+| GET / PATCH | `/api/profile` | account, teams with members, work summary / change display name |
+| POST | `/api/profile/password` | `{current_password, new_password}`; the only action allowed while holding a temporary password |
+| GET | `/api/admin/summary` | **admin only** (all `/api/admin/*` are): counts of teams, users, admins |
+| GET / POST | `/api/admin/teams` | list (`q`, `page`) / create `{name}` |
+| GET | `/api/admin/teams/options` | every team's id and name (for pickers) |
+| PATCH / DELETE | `/api/admin/teams/{id}` | rename `{name}` / delete `{confirm_name}` |
+| GET | `/api/admin/teams/{id}/members` | members with role and active flag |
+| GET / POST | `/api/admin/users` | list (`q`, `page`) / create `{name, email, temporary_password, is_admin?, memberships: [{team_id, role}]}` |
+| GET / PATCH | `/api/admin/users/{id}` | read / change `name`, `email`, `is_admin`, `active` (409 `LAST_ADMIN`, `SELF_DEACTIVATE`) |
+| POST | `/api/admin/users/{id}/password` | `{temporary_password}`: the user must change it at next sign-in |
+| PUT / DELETE | `/api/admin/users/{id}/teams/{team_id}` | add or change role `{role}` / remove (409 `TEAM_NEEDS_LEAD`) |
 | POST | `/api/items/{id}/comments` | Idempotency-Key |
 | GET | `/api/items/{id}/activity` | newest first, 50 per page, `before_id` cursor |
-| GET | `/api/items/counts` | tasks per status for the same filters as `/api/items` (board column counts) |
+| GET | `/api/items/counts` | tasks per status id for one team (`team_id` required) with the same filters as `/api/items` |
 | GET | `/api/events` | live-update stream (`text/event-stream`): `{type: "change", item_id, team_ids, actor_id, kind}` |
 
 Errors always look like `{"error": {"code", "message", "details"}}`.
@@ -234,16 +315,20 @@ Errors always look like `{"error": {"code", "message", "details"}}`.
   Notices about tasks moved out of your team stop when you reload the page.
 * **Uvicorn waits for open live-update streams on shutdown**, which is why the
   run command includes `--timeout-graceful-shutdown 3`.
-* **Reasons are asked for with the browser's prompt box**, and dragging cards
-  needs a mouse (on touch screens, use the card's status dropdown).
+* **Dragging cards needs a mouse.** On touch screens use the card's status dropdown.
+  A lead's rejection reason is asked for with the browser's prompt box.
+* **Statuses are per team.** Renaming a custom status doesn't rename it in other
+  teams, and the List page's status filter matches by name across your teams.
 * **Fonts load from Google Fonts.** Offline, the app falls back to system fonts.
 * **No notifications or background jobs.** The attention views are how people
   find what needs them; there is no email/Slack delivery.
-* **Open sign-up.** Anyone who can reach the app can create an account and join
-  any team as a member (team names are listed on the sign-up page). There is no
-  email verification, invite or approval step, and no screen for adding a second
-  team or promoting someone to lead afterwards (SQL only).
-* No password reset or SSO; login is email + password.
+* **No self-service password reset or SSO.** Login is email + password; a forgotten
+  password is reset by an admin, who then passes on a temporary one. If an admin
+  forgets theirs, another admin resets it (or use `python -m app.create_admin`).
+* **Temporary passwords are shown to the admin and passed on by hand**; there is no
+  email delivery. Users can't be deleted (only deactivated, so history stays).
+* **No audit log of admin actions** (who added or removed whom). Task history does
+  record when a removed member's tasks were unassigned, and by which admin.
 * **CSRF** protection relies on `SameSite=Lax` session cookies and JSON request
   bodies; there are no CSRF tokens.
 * **Page-number pagination.** If items change between page loads, a row can be

@@ -1,9 +1,7 @@
 -- Whole schema. Safe to re-run: it drops everything first.
-DROP TABLE IF EXISTS idempotency_keys, activity, work_items, memberships, teams, users CASCADE;
+DROP TABLE IF EXISTS idempotency_keys, activity, work_items, statuses, memberships, teams, users CASCADE;
 DROP TYPE IF EXISTS item_status, item_priority, item_type CASCADE;
 
-CREATE TYPE item_status AS ENUM
-    ('awaiting_approval', 'open', 'in_progress', 'blocked', 'done', 'cancelled');
 -- Declaration order is sort order: ORDER BY priority puts urgent first.
 CREATE TYPE item_priority AS ENUM ('urgent', 'high', 'medium', 'low');
 CREATE TYPE item_type AS ENUM
@@ -13,7 +11,10 @@ CREATE TABLE users (
     id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     email         text NOT NULL UNIQUE,
     name          text NOT NULL,
-    password_hash text NOT NULL
+    password_hash text NOT NULL,
+    is_admin      boolean NOT NULL DEFAULT false,         -- manages teams, users and membership
+    active        boolean NOT NULL DEFAULT true,          -- false = cannot log in; history stays
+    must_change_password boolean NOT NULL DEFAULT false   -- set while the password is a temporary one
 );
 
 CREATE TABLE teams (
@@ -29,6 +30,23 @@ CREATE TABLE memberships (
 );
 CREATE INDEX memberships_team_idx ON memberships (team_id);
 
+-- Per-team board columns. Three defaults per team (todo / in_progress / completed)
+-- plus custom ones; `finished` ones take their tasks out of the "needs attention" views.
+CREATE TABLE statuses (
+    id       uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    team_id  uuid NOT NULL REFERENCES teams (id) ON DELETE CASCADE,
+    name     text NOT NULL,
+    kind     text NOT NULL CHECK (kind IN ('todo', 'in_progress', 'completed', 'custom')),
+    color    text NOT NULL DEFAULT 'slate',
+    finished boolean NOT NULL DEFAULT false,
+    position integer NOT NULL,
+    CHECK (kind <> 'completed' OR finished),
+    CHECK (kind NOT IN ('todo', 'in_progress') OR NOT finished)
+);
+CREATE UNIQUE INDEX statuses_team_name_idx ON statuses (team_id, lower(name));
+CREATE UNIQUE INDEX statuses_team_kind_idx ON statuses (team_id, kind) WHERE kind <> 'custom';
+CREATE INDEX statuses_team_pos_idx ON statuses (team_id, position);
+
 CREATE TABLE work_items (
     id                uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     team_id           uuid NOT NULL REFERENCES teams (id) ON DELETE CASCADE,
@@ -36,10 +54,12 @@ CREATE TABLE work_items (
     description       text NOT NULL DEFAULT '',
     type              item_type NOT NULL,
     priority          item_priority NOT NULL,
-    status            item_status NOT NULL,
+    status_id         uuid NOT NULL REFERENCES statuses (id),
     assignee_id       uuid REFERENCES users (id) ON DELETE SET NULL,
     assigned_by       uuid REFERENCES users (id) ON DELETE SET NULL,  -- who made the current assignment
     requires_approval boolean NOT NULL,
+    approval          text CHECK (approval IN ('pending', 'approved', 'rejected')),  -- NULL = no approval needed
+    approval_by       uuid REFERENCES users (id) ON DELETE SET NULL,
     restricted        boolean NOT NULL DEFAULT false,  -- details editable by leads + creator only
     due_at            timestamptz,
     created_by        uuid NOT NULL REFERENCES users (id) ON DELETE CASCADE,
@@ -54,8 +74,8 @@ CREATE TABLE work_items (
 );
 CREATE INDEX work_items_search_idx ON work_items USING gin (search);
 CREATE INDEX work_items_team_status_idx
-    ON work_items (team_id, status, priority, last_activity_at DESC);
-CREATE INDEX work_items_assignee_idx ON work_items (assignee_id, status);
+    ON work_items (team_id, status_id, priority, last_activity_at DESC);
+CREATE INDEX work_items_assignee_idx ON work_items (assignee_id, status_id);
 CREATE INDEX work_items_created_by_idx ON work_items (created_by);
 
 -- Append-only history of everything that happened to an item (comments included).

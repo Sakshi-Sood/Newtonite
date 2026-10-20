@@ -15,11 +15,13 @@ from psycopg.types.json import Jsonb
 from app.auth import hash_password
 from app.config import DATABASE_URL
 from app.db import apply_schema
+from app.statuses import create_defaults
 
 TEAMS = ["Payments", "Platform", "Support", "Compliance", "Customer Success", "Infrastructure"]
 
 # email, name, {team: role}
 DEMO_USERS = [
+    ("admin@newtonite.test", "Ada Admin", {}),  # an admin, in no team: manages everything from the admin dashboard
     ("lead@newtonite.test", "Lena Lead", {"Payments": "lead", "Platform": "lead"}),
     ("lead2@newtonite.test", "Omar Second", {"Payments": "lead"}),
     ("member@newtonite.test", "Maya Member", {"Payments": "member", "Platform": "member"}),
@@ -44,7 +46,9 @@ TITLES = {
     "task": ["Rotate API credentials", "Update on-call rota", "Approve vendor contract renewal",
              "Prepare monthly ops report"],
 }
-STATUS_WEIGHTS = {"awaiting_approval": 6, "open": 22, "in_progress": 24, "blocked": 6, "done": 34, "cancelled": 8}
+# The three default statuses plus one custom one every demo team gets, to show custom columns.
+STATUS_WEIGHTS = {"To do": 30, "In progress": 26, "In review": 10, "Completed": 34}
+CUSTOM = (("In review", "teal", False),)
 PRIORITY_WEIGHTS = {"urgent": 6, "high": 20, "medium": 50, "low": 24}
 
 
@@ -66,6 +70,13 @@ def main() -> None:
         team_ids = {name: conn.execute("INSERT INTO teams (name) VALUES (%s) RETURNING id", (name,)).fetchone()[0]
                     for name in TEAMS}
         members: dict[str, list[tuple[uuid.UUID, str]]] = {name: [] for name in TEAMS}
+        status_ids: dict[str, dict[str, uuid.UUID]] = {}
+        for name, tid in team_ids.items():
+            create_defaults(conn, tid)
+            for position, (sname, color, finished) in enumerate(CUSTOM, start=4):
+                conn.execute("""INSERT INTO statuses (team_id, name, kind, color, finished, position)
+                                VALUES (%s, %s, 'custom', %s, %s, %s)""", (tid, sname, color, finished, position))
+            status_ids[name] = {r[0]: r[1] for r in conn.execute("SELECT name, id FROM statuses WHERE team_id = %s", (tid,))}
 
         def add_user(email: str, name: str, teams: dict[str, str]) -> None:
             uid = conn.execute("INSERT INTO users (email, name, password_hash) VALUES (%s, %s, %s) RETURNING id",
@@ -76,6 +87,7 @@ def main() -> None:
 
         for email, name, teams in DEMO_USERS:
             add_user(email, name, teams)
+        conn.execute("UPDATE users SET is_admin = true WHERE email = 'admin@newtonite.test'")
         for i in range(args.users - len(DEMO_USERS)):
             name = f"{rng.choice(FIRST)} {rng.choice(LAST)}"
             teams = {t: ("lead" if rng.random() < 0.15 else "member") for t in rng.sample(TEAMS, rng.choice([1, 1, 2]))}
@@ -95,26 +107,31 @@ def main() -> None:
             status = pick(rng, STATUS_WEIGHTS)
             created_at = now - timedelta(days=rng.uniform(0, 120))
             last_activity = created_at + (now - created_at) * rng.random() ** 2
-            needs_assignee = status in ("in_progress", "blocked", "done") or (status == "open" and rng.random() < 0.4)
+            needs_assignee = status in ("In progress", "In review", "Completed") or (status == "To do" and rng.random() < 0.4)
+            # Some tasks need a lead's approval: waiting (only while To do) or already approved.
+            needs_approval = rng.random() < 0.1
+            approval = ("pending" if status == "To do" and rng.random() < 0.6 else "approved") if needs_approval else None
+            if approval == "pending":
+                needs_assignee = False
             due_at = now + timedelta(days=rng.uniform(-10, 25)) if rng.random() < 0.3 else None
             item_id = uuid.uuid4()
             item_rows.append((
                 item_id, team_ids[team], f"{rng.choice(TITLES[item_type])} #{1000 + n}",
                 f"Reported via the {team} queue. Investigate, act, and record the outcome here.",
-                item_type, pick(rng, PRIORITY_WEIGHTS), status,
+                item_type, pick(rng, PRIORITY_WEIGHTS), status_ids[team][status],
                 rng.choice(people) if needs_assignee else None,
-                status == "awaiting_approval" or rng.random() < 0.1, due_at, rng.choice(people),
+                needs_approval, approval, due_at, rng.choice(people),
                 created_at, last_activity, last_activity,
             ))
-            activity_rows.append((item_id, item_rows[-1][10], "created", Jsonb({"status": status}), created_at))
+            activity_rows.append((item_id, item_rows[-1][11], "created", Jsonb({"status": "To do"}), created_at))
 
         with conn.cursor() as cur:
             for i in range(0, len(item_rows), 1000):
                 cur.executemany(
-                    """INSERT INTO work_items (id, team_id, title, description, type, priority, status,
-                           assignee_id, requires_approval, due_at, created_by, created_at, updated_at,
+                    """INSERT INTO work_items (id, team_id, title, description, type, priority, status_id,
+                           assignee_id, requires_approval, approval, due_at, created_by, created_at, updated_at,
                            last_activity_at)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                     item_rows[i:i + 1000],
                 )
                 cur.executemany(
@@ -123,7 +140,7 @@ def main() -> None:
                 )
         conn.execute("ANALYZE")
     print(f"Seeded {len(TEAMS)} teams, {args.users} users, {args.items} work items.")
-    print("Log in as lead@ / lead2@ / member@ / outsider@newtonite.test with password 'password'.")
+    print("Log in as admin@ / lead@ / lead2@ / member@ / outsider@newtonite.test with password 'password'.")
 
 
 if __name__ == "__main__":
