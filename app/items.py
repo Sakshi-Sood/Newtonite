@@ -11,7 +11,7 @@ from psycopg.types.json import Jsonb
 from pydantic import AfterValidator, BaseModel, StringConstraints, model_validator
 
 from app.errors import AppError
-from app.rules import ITEM_TYPES, PRIORITIES, allowed_actions, can
+from app.rules import ACTIONS, ITEM_TYPES, PRIORITIES, REASON_REQUIRED, TERMINAL, allowed_actions, can, next_status
 
 Title = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
 Description = Annotated[str, StringConstraints(max_length=20000)]
@@ -55,6 +55,17 @@ class ItemPatch(BaseModel):
 
 class CommentIn(BaseModel):
     body: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=10000)]
+
+
+class AssignIn(BaseModel):
+    assignee_id: uuid.UUID | None
+    expected_version: int
+
+
+class TransitionIn(BaseModel):
+    action: Literal[ACTIONS]
+    reason: Annotated[str, StringConstraints(strip_whitespace=True, max_length=2000)] | None = None
+    expected_version: int
 
 
 def _not_found() -> AppError:
@@ -185,6 +196,92 @@ def update_item(conn: Connection, item_id: str, user_id, expected_version: int, 
     if updated is None:
         raise stale_error(conn, row["id"], user_id, role)
     record_activity(conn, row["id"], user_id, "updated", {"changes": diffs})
+    return _fresh_dto(conn, row["id"], user_id, role)
+
+
+def _user_ref(conn: Connection, user_id) -> dict | None:
+    if user_id is None:
+        return None
+    row = conn.execute("SELECT id, name FROM users WHERE id = %s", (user_id,)).fetchone()
+    return {"id": row["id"], "name": row["name"]} if row else None
+
+
+def _assignment_payload(conn: Connection, old_id, new_id) -> dict:
+    old, new = _user_ref(conn, old_id), _user_ref(conn, new_id)
+    return {"from": old_id, "to": new_id,
+            "from_name": old["name"] if old else None, "to_name": new["name"] if new else None}
+
+
+def _already_claimed(conn: Connection, item_id) -> AppError:
+    row = conn.execute("SELECT assignee_id FROM work_items WHERE id = %s", (item_id,)).fetchone()
+    return AppError(409, "ALREADY_CLAIMED", "Someone else already took this item.",
+                    {"assignee": _user_ref(conn, row["assignee_id"])})
+
+
+def claim_item(conn: Connection, item_id: str, user_id) -> dict:
+    """Take an unassigned item. A single conditional UPDATE decides the race:
+    whoever's statement runs first wins; everyone else gets 409 naming the winner.
+    No expected_version: an unrelated edit shouldn't make a claim fail.
+    """
+    row, role = load_item(conn, item_id, user_id)
+    if row["assignee_id"] is not None and str(row["assignee_id"]) == str(user_id):
+        return item_dto(conn, row, user_id, role)
+    if row["assignee_id"] is not None and row["status"] not in TERMINAL:
+        raise _already_claimed(conn, row["id"])
+    require(row, user_id, role, "claim")
+    updated = conn.execute(
+        """UPDATE work_items SET assignee_id = %s, version = version + 1, updated_at = now()
+           WHERE id = %s AND assignee_id IS NULL AND status NOT IN ('done', 'cancelled')
+           RETURNING *""",
+        (user_id, row["id"]),
+    ).fetchone()
+    if updated is None:
+        raise _already_claimed(conn, row["id"])
+    record_activity(conn, row["id"], user_id, "assigned", _assignment_payload(conn, None, user_id))
+    return _fresh_dto(conn, row["id"], user_id, role)
+
+
+def assign_item(conn: Connection, item_id: str, user_id, assignee_id, expected_version: int) -> dict:
+    row, role = load_item(conn, item_id, user_id)
+    require(row, user_id, role, "assign")
+    if assignee_id is not None and role_in_team(conn, assignee_id, row["team_id"]) is None:
+        raise AppError(422, "INVALID_ASSIGNEE", "The assignee must be a member of the item's team.")
+    if str(row["assignee_id"]) == str(assignee_id):
+        return item_dto(conn, row, user_id, role)
+    updated = conn.execute(
+        """UPDATE work_items SET assignee_id = %s, version = version + 1, updated_at = now()
+           WHERE id = %s AND version = %s RETURNING *""",
+        (assignee_id, row["id"], expected_version),
+    ).fetchone()
+    if updated is None:
+        raise stale_error(conn, row["id"], user_id, role)
+    record_activity(conn, row["id"], user_id, "assigned",
+                    _assignment_payload(conn, row["assignee_id"], assignee_id))
+    return _fresh_dto(conn, row["id"], user_id, role)
+
+
+def transition_item(conn: Connection, item_id: str, user_id, action: str, reason: str | None,
+                    expected_version: int) -> dict:
+    # Row lock: concurrent transitions on one item run one after another.
+    row, role = load_item(conn, item_id, user_id, for_update=True)
+    if row["version"] != expected_version:
+        raise stale_error(conn, row["id"], user_id, role)
+    new_status = next_status(row["status"], action)
+    if new_status is None:
+        raise AppError(422, "INVALID_TRANSITION", f"Cannot {action} an item that is {row['status']}.",
+                       {"from": row["status"], "action": action})
+    require(row, user_id, role, action)
+    reason = (reason or "").strip() or None
+    if action in REASON_REQUIRED and not reason:
+        raise AppError(400, "REASON_REQUIRED", f"A reason is required to {action} this item.")
+    if action == "start" and row["assignee_id"] is None:
+        raise AppError(422, "ASSIGNEE_REQUIRED", "Assign the item to someone before starting it.")
+    conn.execute(
+        "UPDATE work_items SET status = %s, version = version + 1, updated_at = now() WHERE id = %s",
+        (new_status, row["id"]),
+    )
+    record_activity(conn, row["id"], user_id, "status_changed",
+                    {"from": row["status"], "to": new_status, "action": action, "reason": reason})
     return _fresh_dto(conn, row["id"], user_id, role)
 
 

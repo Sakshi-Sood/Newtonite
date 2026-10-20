@@ -350,6 +350,111 @@ def check_patch_cancelled_item_403():
     expect_error(lambda: call(update_item, it["id"], m["id"], 1, {"title": "x"}), 403, "FORBIDDEN")
 
 
+# ---- Task 7: claim, assign, transitions -----------------------------------
+
+def check_ten_concurrent_claims_one_winner():
+    from app.items import claim_item
+
+    t = team()
+    creator = user("member", t["id"])
+    it = create(creator, t["id"])
+    members = [user("member", t["id"]) for _ in range(10)]
+    with ThreadPoolExecutor(10) as ex:
+        results = list(ex.map(lambda u: outcome(lambda: call(claim_item, it["id"], u["id"])), members))
+    winners = [r for code, r in results if code == "ok"]
+    losers = [e for code, e in results if code == "ALREADY_CLAIMED"]
+    assert len(winners) == 1 and len(losers) == 9, [c for c, _ in results]
+    winner_id = winners[0]["assignee"]["id"]
+    assert all(e.details["assignee"]["id"] == winner_id for e in losers)
+    assert activity_kinds(it["id"]).count("assigned") == 1
+
+
+def check_claim_own_item_noop():
+    from app.items import claim_item
+
+    t = team()
+    m = user("member", t["id"])
+    it = create(m, t["id"])
+    call(claim_item, it["id"], m["id"])
+    again = call(claim_item, it["id"], m["id"])
+    assert again["version"] == 2 and activity_kinds(it["id"]).count("assigned") == 1
+
+
+def check_assign_to_outsider_422_unchanged():
+    from app.items import assign_item
+
+    t = team()
+    lead = user("lead", t["id"])
+    outsider = user()
+    it = create(lead, t["id"])
+    expect_error(lambda: call(assign_item, it["id"], lead["id"], outsider["id"], 1), 422, "INVALID_ASSIGNEE")
+    row = sql("SELECT assignee_id, version FROM work_items WHERE id = %s", (it["id"],))[0]
+    assert row["assignee_id"] is None and row["version"] == 1
+
+
+def check_member_cannot_assign_403():
+    from app.items import assign_item
+
+    t = team()
+    m, other = user("member", t["id"]), user("member", t["id"])
+    it = create(m, t["id"])
+    expect_error(lambda: call(assign_item, it["id"], m["id"], other["id"], 1), 403, "FORBIDDEN")
+
+
+def transition(it, u, action, version, reason=None):
+    from app.items import transition_item
+
+    return call(transition_item, it["id"], u["id"], action, reason, version)
+
+
+def check_open_to_complete_422_invalid_transition():
+    t = team()
+    lead = user("lead", t["id"])
+    it = create(lead, t["id"])
+    expect_error(lambda: transition(it, lead, "complete", 1, "done"), 422, "INVALID_TRANSITION")
+
+
+def check_start_without_assignee_422():
+    t = team()
+    lead = user("lead", t["id"])
+    it = create(lead, t["id"])
+    expect_error(lambda: transition(it, lead, "start", 1), 422, "ASSIGNEE_REQUIRED")
+
+
+def check_block_without_reason_400():
+    t = team()
+    m = user("member", t["id"])
+    it = item(m, t["id"], status="in_progress", assignee_id=m["id"])
+    expect_error(lambda: transition(it, m, "block", 1, "   "), 400, "REASON_REQUIRED")
+    assert transition(it, m, "block", 1, "Waiting on bank")["status"] == "blocked"
+
+
+def check_creator_lead_cannot_approve_other_lead_can():
+    t = team()
+    lead1, lead2 = user("lead", t["id"]), user("lead", t["id"])
+    it = create(lead1, t["id"], requires_approval=True)
+    expect_error(lambda: transition(it, lead1, "approve", 1), 403, "FORBIDDEN")
+    assert transition(it, lead2, "approve", 1)["status"] == "open"
+
+
+def check_non_assignee_member_cannot_complete():
+    t = team()
+    owner, other = user("member", t["id"]), user("member", t["id"])
+    it = item(owner, t["id"], status="in_progress", assignee_id=owner["id"])
+    expect_error(lambda: transition(it, other, "complete", 1, "fixed"), 403, "FORBIDDEN")
+    assert transition(it, owner, "complete", 1, "fixed")["status"] == "done"
+
+
+def check_stale_transition_409():
+    from app.items import update_item
+
+    t = team()
+    m = user("member", t["id"])
+    it = item(m, t["id"], status="in_progress", assignee_id=m["id"])
+    call(update_item, it["id"], m["id"], 1, {"priority": "urgent"})
+    expect_error(lambda: transition(it, m, "complete", 1, "fixed"), 409, "STALE_VERSION")
+
+
 # ---- runner ---------------------------------------------------------------
 
 def main() -> int:
