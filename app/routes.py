@@ -5,12 +5,43 @@ from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
 from psycopg import Connection
 
-from app import items
+from app import items, listing
 from app.auth import current_user
 from app.db import get_conn
 from app.idempotency import request_hash, run_idempotent
 
 router = APIRouter(prefix="/api/items")
+overview_router = APIRouter(prefix="/api")
+
+
+def _csv(value: str | None) -> list[str]:
+    return [v.strip() for v in value.split(",") if v.strip()] if value else []
+
+
+@overview_router.get("/overview")
+def overview(user: dict = Depends(current_user), conn: Connection = Depends(get_conn)):
+    return {"counts": listing.overview_counts(conn, user["id"])}
+
+
+@router.get("")
+def list_items(
+    view: str | None = None,
+    team_id: str | None = None,
+    status: str | None = None,
+    priority: str | None = None,
+    type: str | None = None,
+    assignee: str | None = None,
+    q: str | None = None,
+    sort: str | None = None,
+    page: int = Query(1, ge=1, le=10000),
+    page_size: int = Query(25, ge=1, le=100),
+    user: dict = Depends(current_user),
+    conn: Connection = Depends(get_conn),
+):
+    return listing.list_items(
+        conn, user["id"], view=view, team_id=team_id, status=_csv(status), priority=_csv(priority),
+        type=_csv(type), assignee=assignee, q=q, sort=sort, page=page, page_size=page_size,
+    )
 
 
 def _idempotent(request: Request, conn: Connection, user: dict, body, fn: Callable[[], tuple[int, dict]]):

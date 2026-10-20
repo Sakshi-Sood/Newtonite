@@ -27,6 +27,7 @@ def create_app() -> FastAPI:
     install_handlers(app)
     app.include_router(auth.router)
     app.include_router(routes.router)
+    app.include_router(routes.overview_router)
     # Static frontend last, so /api routes take precedence.
     app.mount("/", StaticFiles(directory=STATIC_DIR, html=True, check_dir=False), name="static")
     return app
