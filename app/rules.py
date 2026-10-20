@@ -7,7 +7,7 @@ so the UI can show only the controls that will actually work.
 STATUSES = ("awaiting_approval", "open", "in_progress", "blocked", "done", "cancelled")
 PRIORITIES = ("urgent", "high", "medium", "low")
 ITEM_TYPES = ("customer_issue", "engineering", "payment", "incident", "compliance", "task")
-ROLES = ("member", "lead")
+ROLES = ("member", "lead")  # team membership roles; "requester" is derived (created it, not in the team)
 TERMINAL = {"done", "cancelled"}
 
 ACTIONS = ("approve", "reject", "start", "block", "unblock", "complete", "reopen", "cancel")
@@ -38,21 +38,36 @@ def _same(a, b) -> bool:
 
 
 def allowed_actions(item: dict, user_id, role: str | None) -> list[str]:
-    """Everything `user_id` (with `role` in the item's team) may do to `item`."""
+    """Everything `user_id` may do to `item`.
+
+    `role` is the user's role in the item's team ("member" / "lead"), or
+    "requester" when they created the item but aren't in its team, or None.
+    """
     if role is None:
         return []
     is_lead = role == "lead"
     terminal = item["status"] in TERMINAL
     is_assignee = _same(item["assignee_id"], user_id)
     is_creator = _same(item["created_by"], user_id)
+    restricted = bool(item.get("restricted"))
 
     acts = ["view"]
-    if not terminal:
+    # Editing details (and moving to another team). A restricted item can only
+    # be edited by leads and its creator; status changes are not affected.
+    if not terminal and (is_lead or is_creator or not restricted):
         acts.append("edit")
     acts.append("comment")
+    if not terminal and is_creator and not is_lead:
+        # Tick/untick "Restrict editing". Leads can always edit, so it's only
+        # offered to a creator who isn't a lead.
+        acts.append("restrict")
+    if role == "requester":
+        return acts  # requesters follow and edit; the owning team does the work
     if not terminal and item["assignee_id"] is None:
         acts.append("claim")
-    if not terminal and is_lead:
+    # (Re)assign: any lead, or whoever made the current assignment. Someone who
+    # was handed a task can't pass it on.
+    if not terminal and (is_lead or _same(item.get("assigned_by"), user_id)):
         acts.append("assign")
 
     for action in ACTIONS:

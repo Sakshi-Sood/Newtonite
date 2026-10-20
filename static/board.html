@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Board · Newtonite Ops</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600..800&family=Figtree:wght@400;500;600;700&display=swap">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body data-page="board">
+  <header id="topbar"></header>
+  <main class="wide">
+    <h1 class="sr-only">Board</h1>
+    <div id="live-banner" class="banner" hidden></div>
+    <div id="flash" class="flash" hidden></div>
+    <div class="chips" role="toolbar" aria-label="Quick filters">
+      <button type="button" class="chip" data-chip="mine" aria-pressed="false">My tasks</button>
+      <button type="button" class="chip" data-chip="unassigned" aria-pressed="false">Unassigned</button>
+      <button type="button" class="chip" data-chip="urgent" aria-pressed="false">Urgent &amp; high</button>
+      <button type="button" class="chip" data-chip="overdue" aria-pressed="false">Overdue</button>
+      <button type="button" class="chip" data-chip="requested" aria-pressed="false">Requested by me</button>
+      <select id="board-team" aria-label="Team"><option value="">All my teams</option></select>
+      <input id="board-q" class="search" type="search" placeholder="Search the board" aria-label="Search the board">
+      <details class="help">
+        <summary>How it works</summary>
+        <div class="help-body">
+          <p>Drag a card to another column to change its status. While you drag, columns it can't move to fade out.</p>
+          <p>Every card also has a status dropdown, which works with a keyboard or on a phone.</p>
+          <p>Done and Cancelled are folded to save room. Click one to open it. You can still drop cards on them while folded.</p>
+        </div>
+      </details>
+    </div>
+    <p id="board-error" class="error" hidden></p>
+    <div id="board" class="board"></div>
+  </main>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

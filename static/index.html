@@ -3,20 +3,26 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Overview · Newtonite Ops</title>
+  <title>List · Newtonite Ops</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600..800&family=Figtree:wght@400;500;600;700&display=swap">
   <link rel="stylesheet" href="/style.css">
 </head>
 <body data-page="overview">
   <header id="topbar"></header>
-  <main>
-    <section aria-label="Needs attention">
-      <h2>Needs attention</h2>
-      <div id="tiles" class="tiles"></div>
+  <main class="list-page">
+    <div id="live-banner" class="banner" hidden></div>
+    <div id="flash" class="flash" hidden></div>
+
+    <section aria-labelledby="greeting" class="intro">
+      <h1 id="greeting">Hello</h1>
+      <p id="summary" class="summary"></p>
+      <div id="tiles" class="tiles" aria-label="Views of your work"></div>
     </section>
 
-    <section aria-label="Work items">
+    <section aria-label="Tasks">
       <form id="filters" class="filters">
-        <input name="q" type="search" placeholder="Search titles and descriptions…" aria-label="Search">
+        <input name="q" type="search" placeholder="Search titles and descriptions" aria-label="Search">
         <select name="team_id" aria-label="Team"><option value="">All my teams</option></select>
         <select name="status" aria-label="Status"><option value="">Any status</option></select>
         <select name="priority" aria-label="Priority"><option value="">Any priority</option></select>
@@ -26,25 +32,28 @@
           <option value="unassigned">Unassigned</option>
         </select>
         <select name="sort" aria-label="Sort">
-          <option value="">Sort: priority</option>
-          <option value="updated">Sort: recently active</option>
-          <option value="created">Sort: newest</option>
+          <option value="">Sort by priority</option>
+          <option value="updated">Sort by recent activity</option>
+          <option value="created">Sort by newest</option>
         </select>
-        <button type="button" id="clear-filters">Clear</button>
+        <button type="button" id="clear-filters">Clear filters</button>
       </form>
-      <p id="active-view" class="muted" hidden></p>
+      <div class="list-meta">
+        <p id="result-count" class="muted"></p>
+        <p id="active-view" class="muted" hidden></p>
+      </div>
       <p id="list-error" class="error" hidden></p>
-      <table class="items">
-        <thead>
-          <tr><th>Title</th><th>Team</th><th>Status</th><th>Priority</th><th>Assignee</th><th>Last activity</th></tr>
-        </thead>
-        <tbody id="rows"></tbody>
-      </table>
-      <p id="empty" class="muted" hidden>No work items match these filters.</p>
-      <nav class="pager">
-        <button type="button" id="prev">← Previous</button>
+      <div class="table-wrap">
+        <table class="items">
+          <thead><tr id="head-row"></tr></thead>
+          <tbody id="rows"></tbody>
+        </table>
+        <p id="empty" class="empty-state" hidden>No tasks match these filters. Clear them, or create a task.</p>
+      </div>
+      <nav class="pager" id="pager" hidden>
+        <button type="button" id="prev">Previous page</button>
         <span id="page-label" class="muted"></span>
-        <button type="button" id="next">Next →</button>
+        <button type="button" id="next">Next page</button>
       </nav>
     </section>
   </main>
