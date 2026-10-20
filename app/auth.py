@@ -1,13 +1,16 @@
-"""Password hashing, session login, and the current_user dependency."""
+"""Password hashing, session login, first-run setup, and the user dependencies.
+
+There is no public sign-up: accounts are created by an admin (app.admin), except
+the very first admin, who is created once on an empty database (/api/setup).
+"""
 import hashlib
 import hmac
 import secrets
-import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request, Response
 from psycopg import Connection
-from pydantic import BaseModel, StringConstraints, model_validator
+from pydantic import BaseModel, StringConstraints
 
 from app import statuses
 from app.db import Conn
@@ -38,19 +41,49 @@ def verify_password(pw: str, stored: str) -> bool:
 # Used when the email is unknown, so a wrong email costs the same time as a wrong password.
 _DUMMY_HASH = hash_password(secrets.token_hex(8))
 
+Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
+Email = Annotated[str, StringConstraints(strip_whitespace=True, to_lower=True, max_length=254,
+                                         pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")]
+Password = Annotated[str, StringConstraints(min_length=8, max_length=200)]
 
-def current_user(request: Request, conn: Conn) -> dict:
+_USER_COLUMNS = "id, email, name, is_admin, active, must_change_password"
+
+
+def session_user(request: Request, conn: Conn) -> dict:
+    """The signed-in user, re-read from the database on every request, so a
+    deactivated account is locked out at once. Does not enforce the
+    change-your-temporary-password step (see current_user)."""
     user_id = request.session.get("user_id")
     if not user_id:
         raise AppError(401, "UNAUTHENTICATED", "Please log in.")
-    row = conn.execute("SELECT id, email, name FROM users WHERE id = %s", (user_id,)).fetchone()
-    if row is None:
+    row = conn.execute(f"SELECT {_USER_COLUMNS} FROM users WHERE id = %s", (user_id,)).fetchone()
+    if row is None or not row["active"]:
         request.session.clear()
         raise AppError(401, "UNAUTHENTICATED", "Please log in.")
     return row
 
 
+def current_user(user: Annotated[dict, Depends(session_user)]) -> dict:
+    """For everything except changing the password: a user holding a temporary
+    password must choose their own before doing anything else."""
+    if user["must_change_password"]:
+        raise AppError(403, "PASSWORD_CHANGE_REQUIRED", "Choose your own password before continuing.")
+    return user
+
+
+def require_admin(user: Annotated[dict, Depends(current_user)]) -> dict:
+    if not user["is_admin"]:
+        raise AppError(403, "FORBIDDEN", "Only admins can do this.", {"permission": "admin"})
+    return user
+
+
 User = Annotated[dict, Depends(current_user)]
+SessionUser = Annotated[dict, Depends(session_user)]
+Admin = Annotated[dict, Depends(require_admin)]
+
+
+def public_user(row: dict) -> dict:
+    return {k: row[k] for k in ("id", "email", "name", "is_admin", "must_change_password")}
 
 
 class LoginIn(BaseModel):
@@ -58,84 +91,61 @@ class LoginIn(BaseModel):
     password: str
 
 
-Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
-Email = Annotated[str, StringConstraints(strip_whitespace=True, to_lower=True, max_length=254,
-                                         pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")]
-
-
-class SignupIn(BaseModel):
+class SetupIn(BaseModel):
     name: Name
     email: Email
-    password: Annotated[str, StringConstraints(min_length=8, max_length=200)]
-    # Exactly one: join an existing team as member, or create a team and lead it.
-    team_id: uuid.UUID | None = None
-    new_team_name: Name | None = None
-
-    @model_validator(mode="after")
-    def _one_team_choice(self):
-        if (self.team_id is None) == (self.new_team_name is None):
-            raise ValueError("Choose a team to join or name a new team (not both).")
-        return self
+    password: Password
 
 
-def signup(conn: Connection, data: SignupIn) -> dict:
-    """Create the account and its first team membership in one transaction.
-
-    Unique constraints decide races: two sign-ups with one email (or one new
-    team name) can't both succeed, and a failure leaves nothing half-created.
-    """
-    user = conn.execute(
-        """INSERT INTO users (email, name, password_hash) VALUES (%s, %s, %s)
-           ON CONFLICT (email) DO NOTHING RETURNING id, email, name""",
-        (data.email, data.name, hash_password(data.password)),
-    ).fetchone()
-    if user is None:
-        raise AppError(409, "EMAIL_TAKEN", "An account with this email already exists. Try signing in.")
-    if data.new_team_name:
-        team = conn.execute(
-            "INSERT INTO teams (name) VALUES (%s) ON CONFLICT (name) DO NOTHING RETURNING id",
-            (data.new_team_name,),
-        ).fetchone()
-        if team is None:
-            raise AppError(409, "TEAM_NAME_TAKEN", "A team with this name already exists. Join it instead.")
-        statuses.create_defaults(conn, team["id"])
-        role = "lead"
-    else:
-        team = conn.execute("SELECT id FROM teams WHERE id = %s", (data.team_id,)).fetchone()
-        if team is None:
-            raise AppError(422, "INVALID_TEAM", "That team no longer exists.")
-        role = "member"
-    conn.execute("INSERT INTO memberships (user_id, team_id, role) VALUES (%s, %s, %s)",
-                 (user["id"], team["id"], role))
-    return user
+def setup_needed(conn: Connection) -> bool:
+    return conn.execute("SELECT NOT EXISTS (SELECT 1 FROM users) AS needed").fetchone()["needed"]
 
 
-@router.post("/signup", status_code=201)
-def signup_route(body: SignupIn, request: Request, conn: Conn):
-    user = signup(conn, body)
+def create_first_admin(conn: Connection, data: SetupIn) -> dict:
+    """One-time setup: allowed only while the database has no users at all."""
+    conn.execute("LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE")  # two simultaneous setups can't both pass
+    if not setup_needed(conn):
+        raise AppError(409, "SETUP_DONE", "Setup is already complete. Ask an admin for an account.")
+    return conn.execute(
+        f"""INSERT INTO users (email, name, password_hash, is_admin) VALUES (%s, %s, %s, true)
+            RETURNING {_USER_COLUMNS}""",
+        (data.email, data.name, hash_password(data.password))).fetchone()
+
+
+@router.get("/setup")
+def setup_status(conn: Conn):
+    """Does this installation still need its first admin? (No login needed.)"""
+    return {"needed": setup_needed(conn)}
+
+
+@router.post("/setup", status_code=201)
+def setup(body: SetupIn, request: Request, conn: Conn):
+    user = create_first_admin(conn, body)
     request.session.clear()
     request.session["user_id"] = str(user["id"])
-    return {"user": user}
+    return {"user": public_user(user)}
 
 
 @router.get("/teams")
-def list_teams(conn: Conn):
-    """Team names for the sign-up form (no login needed)."""
+def list_teams(user: User, conn: Conn):
+    """Team names, for choosing where to send a task."""
     return conn.execute("SELECT id, name FROM teams ORDER BY name").fetchall()
 
 
 @router.post("/login")
 def login(body: LoginIn, request: Request, conn: Conn):
     row = conn.execute(
-        "SELECT id, email, name, password_hash FROM users WHERE lower(email) = lower(%s)",
+        f"SELECT {_USER_COLUMNS}, password_hash FROM users WHERE lower(email) = lower(%s)",
         (body.email.strip(),),
     ).fetchone()
     ok = verify_password(body.password, row["password_hash"] if row else _DUMMY_HASH)
     if not row or not ok:
         raise AppError(401, "INVALID_CREDENTIALS", "Email or password is incorrect.")
+    if not row["active"]:  # only said to someone who knows the password
+        raise AppError(403, "ACCOUNT_DISABLED", "This account has been deactivated. Ask an admin to reactivate it.")
     request.session.clear()
     request.session["user_id"] = str(row["id"])
-    return {"user": {"id": row["id"], "email": row["email"], "name": row["name"]}}
+    return {"user": public_user(row)}
 
 
 @router.post("/logout", status_code=204)
@@ -145,14 +155,14 @@ def logout(request: Request):
 
 
 @router.get("/me")
-def me(user: User, conn: Conn):
+def me(user: SessionUser, conn: Conn):
     teams = conn.execute(
         """SELECT t.id, t.name, m.role FROM memberships m JOIN teams t ON t.id = m.team_id
            WHERE m.user_id = %s ORDER BY t.name""",
         (user["id"],),
     ).fetchall()
     by_team = statuses.for_user(conn, user["id"])
-    return {"user": user, "teams": [{**t, "statuses": by_team.get(str(t["id"]), [])} for t in teams]}
+    return {"user": public_user(user), "teams": [{**t, "statuses": by_team.get(str(t["id"]), [])} for t in teams]}
 
 
 @router.get("/teams/{team_id}/members")
@@ -164,6 +174,6 @@ def team_members(team_id: str, user: User, conn: Conn):
         raise AppError(404, "NOT_FOUND", "Team not found.")
     return conn.execute(
         """SELECT u.id, u.name, m.role FROM memberships m JOIN users u ON u.id = m.user_id
-           WHERE m.team_id::text = %s ORDER BY u.name""",
+           WHERE m.team_id::text = %s AND u.active ORDER BY u.name""",
         (team_id,),
     ).fetchall()

@@ -21,6 +21,7 @@ TEAMS = ["Payments", "Platform", "Support", "Compliance", "Customer Success", "I
 
 # email, name, {team: role}
 DEMO_USERS = [
+    ("admin@newtonite.test", "Ada Admin", {}),  # an admin, in no team: manages everything from the admin dashboard
     ("lead@newtonite.test", "Lena Lead", {"Payments": "lead", "Platform": "lead"}),
     ("lead2@newtonite.test", "Omar Second", {"Payments": "lead"}),
     ("member@newtonite.test", "Maya Member", {"Payments": "member", "Platform": "member"}),
@@ -86,6 +87,7 @@ def main() -> None:
 
         for email, name, teams in DEMO_USERS:
             add_user(email, name, teams)
+        conn.execute("UPDATE users SET is_admin = true WHERE email = 'admin@newtonite.test'")
         for i in range(args.users - len(DEMO_USERS)):
             name = f"{rng.choice(FIRST)} {rng.choice(LAST)}"
             teams = {t: ("lead" if rng.random() < 0.15 else "member") for t in rng.sample(TEAMS, rng.choice([1, 1, 2]))}
@@ -138,7 +140,7 @@ def main() -> None:
                 )
         conn.execute("ANALYZE")
     print(f"Seeded {len(TEAMS)} teams, {args.users} users, {args.items} work items.")
-    print("Log in as lead@ / lead2@ / member@ / outsider@newtonite.test with password 'password'.")
+    print("Log in as admin@ / lead@ / lead2@ / member@ / outsider@newtonite.test with password 'password'.")
 
 
 if __name__ == "__main__":

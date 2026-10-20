@@ -387,3 +387,31 @@ a.tile.stat:hover { border-color: var(--brand); }
 .member-list li { display: flex; align-items: center; gap: 8px; }
 .settings { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; margin-top: 24px; }
 .settings h2 { margin: 0; font-size: 1.05rem; }
+
+/* ---------- admin dashboard ---------- */
+.admin-page { max-width: 1100px; }
+.subtabs { display: inline-flex; gap: 4px; background: var(--surface-2); border-radius: 999px; padding: 3px; margin: 4px 0 16px; }
+.subtabs button { border: none; background: transparent; border-radius: 999px; padding: 6px 18px; font-weight: 600; color: var(--ink-2); }
+.subtabs button[aria-selected="true"] { background: var(--surface); color: var(--ink); box-shadow: var(--shadow-card); }
+.admin-toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 12px; }
+.admin-toolbar input[type=search] { flex: 1 1 220px; max-width: 360px; }
+.inline-form { display: flex; gap: 8px; flex-wrap: wrap; margin-left: auto; }
+.inline-form input { min-width: 200px; }
+table.admin-table td { white-space: normal; }
+table.admin-table td.title { font-weight: 600; }
+table.admin-table td.row-actions { white-space: nowrap; text-align: right; }
+table.admin-table td.row-actions button + button { margin-left: 6px; }
+tr.inactive-row td { opacity: 0.65; }
+.chip-list { display: flex; flex-wrap: wrap; gap: 6px; }
+.warn-text { color: var(--p-high); font-weight: 600; }
+.member-list-admin { list-style: none; margin: 0; padding: 0; }
+.member-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 8px 0; border-bottom: 1px solid var(--line); }
+.member-row .who-block { flex: 1 1 220px; min-width: 0; overflow-wrap: anywhere; }
+.add-row { align-items: center; }
+.add-row > * { flex: 1 1 150px; }
+.row.inline { flex-wrap: nowrap; }
+.row.inline input { flex: 1 1 auto; }
+.row.inline button { flex: 0 0 auto; }
+#admin-dialog-body h3 { margin: 6px 0 0; font-family: var(--font-head); font-size: 1rem; }
+pre.credentials { background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--radius-s);
+                  padding: 12px; margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; user-select: all; }

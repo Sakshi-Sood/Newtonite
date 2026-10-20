@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Admin · Newtonite Ops</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600..800&family=Figtree:wght@400;500;600;700&display=swap">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body data-page="admin">
+  <header id="topbar"></header>
+  <main class="admin-page">
+    <div id="flash" class="flash" hidden></div>
+    <p id="admin-denied" class="empty-state" hidden>Only admins can open this page. <a href="/">Back to your tasks</a></p>
+
+    <div id="admin-root" hidden>
+      <h1>Admin</h1>
+      <p id="admin-summary" class="summary"></p>
+
+      <div class="subtabs" role="tablist" aria-label="Admin sections">
+        <button type="button" role="tab" id="tab-teams" aria-selected="true" aria-controls="panel-teams">Teams</button>
+        <button type="button" role="tab" id="tab-users" aria-selected="false" aria-controls="panel-users">Users</button>
+      </div>
+
+      <section id="panel-teams" role="tabpanel" aria-labelledby="tab-teams">
+        <div class="admin-toolbar">
+          <input id="team-q" type="search" placeholder="Search teams" aria-label="Search teams">
+          <form id="team-create" class="inline-form">
+            <input name="name" maxlength="100" required placeholder="New team name" aria-label="New team name">
+            <button type="submit" class="primary">Create team</button>
+          </form>
+        </div>
+        <p id="teams-error" class="error" hidden></p>
+        <div class="table-wrap">
+          <table class="items admin-table">
+            <thead><tr><th scope="col">Team</th><th scope="col">Leads</th><th scope="col">Members</th><th scope="col">Open tasks</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead>
+            <tbody id="teams-rows"></tbody>
+          </table>
+          <p id="teams-empty" class="empty-state" hidden>No teams yet. Create the first one above.</p>
+        </div>
+        <p><button type="button" id="teams-more" hidden>Show more teams</button></p>
+      </section>
+
+      <section id="panel-users" role="tabpanel" aria-labelledby="tab-users" hidden>
+        <div class="admin-toolbar">
+          <input id="user-q" type="search" placeholder="Search name or email" aria-label="Search users">
+          <button type="button" id="user-new" class="primary">New user</button>
+        </div>
+        <p id="users-error" class="error" hidden></p>
+        <div class="table-wrap">
+          <table class="items admin-table">
+            <thead><tr><th scope="col">User</th><th scope="col">Teams</th><th scope="col">Status</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead>
+            <tbody id="users-rows"></tbody>
+          </table>
+          <p id="users-empty" class="empty-state" hidden>No users match.</p>
+        </div>
+        <p><button type="button" id="users-more" hidden>Show more users</button></p>
+      </section>
+    </div>
+  </main>
+
+  <dialog id="admin-dialog" aria-labelledby="admin-dialog-title">
+    <div class="dialog-head">
+      <h2 id="admin-dialog-title"></h2>
+      <button type="button" id="admin-dialog-close" aria-label="Close">Close</button>
+    </div>
+    <div id="admin-dialog-body" class="stack"></div>
+  </dialog>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

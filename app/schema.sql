@@ -11,7 +11,10 @@ CREATE TABLE users (
     id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     email         text NOT NULL UNIQUE,
     name          text NOT NULL,
-    password_hash text NOT NULL
+    password_hash text NOT NULL,
+    is_admin      boolean NOT NULL DEFAULT false,         -- manages teams, users and membership
+    active        boolean NOT NULL DEFAULT true,          -- false = cannot log in; history stays
+    must_change_password boolean NOT NULL DEFAULT false   -- set while the password is a temporary one
 );
 
 CREATE TABLE teams (

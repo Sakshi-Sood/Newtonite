@@ -53,24 +53,61 @@ To do with approval pending, and **Blocked** / **Cancelled** become custom statu
 (Cancelled counts as finished) in teams that had such tasks. Take a backup first
 if the data matters (`pg_dump`).
 
-### Creating accounts
+### Accounts and admins
 
-On the sign-in page choose **Create an account**. Enter your name, email and a
-password (8+ characters), then either:
+There is **no public sign-up**. Everyone's account is created by an **admin**.
 
-* **create a new team** — you become its **lead** (the first person in must do this), or
-* **join an existing team** — you become a **member**.
+* **First run (empty database):** opening the app shows a one-time
+  **Create the first admin** page. That admin then creates teams and everyone else.
+  The page closes itself once an account exists.
+* **Existing database with users** (the setup page only appears on an empty one):
+  make one of your users an admin from the command line.
 
-You are signed in straight away. With an empty database, sign up once to create
-a team, then sign up a second person who joins it to try claiming, approving and
-editing the same item from two browsers.
+  ```bash
+  .venv\Scripts\python -m app.create_admin                      # list users and who is an admin
+  .venv\Scripts\python -m app.create_admin --email you@mail.com # make that user an admin
+  .venv\Scripts\python -m app.create_admin --email new@mail.com --name "New Person"   # create an admin (asks for a password)
+  ```
 
+  This is also the way back in if the last admin is ever locked out.
+* **Adding people:** admins open **Admin** in the header, then **Users → New user**:
+  name, email, a **temporary password** (there's a Generate button) and the teams
+  the person joins, each as member or lead. The dialog then shows the sign-in
+  details to pass on. **The new person must choose their own password the first
+  time they sign in**, and can't use the app until they do. Admins can reset a
+  forgotten password the same way.
+
+### The admin dashboard
+
+**Admin** appears in the header for admins only; the server refuses every
+`/api/admin/*` request from anyone else (and `/admin.html` shows "Only admins can
+open this page").
+
+| Tab | What an admin can do |
+|---|---|
+| **Teams** | Create teams (each gets the three default statuses), rename them, delete them (type the team's name to confirm; this deletes its tasks too), and open **Members** to add people, change roles or remove them. |
+| **Users** | Search users, create them, edit name and email, make someone an admin or take it away, **deactivate** or reactivate an account, reset a password, and add the user to teams or remove them. |
+
+Rules the server enforces:
+
+* A team that has members always has **at least one lead**: you can't demote or
+  remove the last lead, and the first person added to an empty team must be a lead.
+* The **last active admin** can't be demoted or deactivated, and nobody can
+  deactivate themselves.
+* A **deactivated** user is locked out immediately (their open sessions stop
+  working), keeps their history, and can't be assigned work.
+* Removing someone from a team **unassigns their tasks** in it, each with a
+  history entry.
+* Being an admin doesn't give access to tasks: an admin works on tasks only in
+  teams they are a member of (they can add themselves). An admin in no team lands
+  on the dashboard after signing in.
 
 ### Demo accounts (only after running the seed; password `password` for every account)
 
 | Email | Teams and roles | Good for trying |
 |---|---|---|
-| `lead@newtonite.test` | Payments **lead**, Platform **lead** | approving, assigning, cancelling |
+| `admin@newtonite.test` | no team, **admin** | the admin dashboard: teams, users, membership |
+| `lead@newtonite.test` | Payments **lead**, Platform **lead** | approving, assigning, managing statuses |
 | `lead2@newtonite.test` | Payments **lead** | approving items `lead@` created |
 | `member@newtonite.test` | Payments member, Platform member | claiming, working items |
 | `outsider@newtonite.test` | Support member | seeing that other teams' items are invisible |
@@ -82,7 +119,7 @@ on the same Payments item: claim it at the same moment, or edit it at the same t
 
 ```bash
 .venv\Scripts\python -m unittest -v          # workflow + permission rules (no database)
-.venv\Scripts\python scripts\check.py        # 68 behaviour checks against the database
+.venv\Scripts\python scripts\check.py        # 74 behaviour checks against the database
 node tests/test_edits.mjs                    # edit/conflict merge rules (frontend, no deps)
 node tests/test_redirect.mjs                 # post-login redirect stays on this site
 node tests/test_state.mjs                    # an older server response never replaces newer state
@@ -182,7 +219,8 @@ team and a member in another.
   didn't create the task, it leaves your list.
 
 The server enforces all of this on every request. The UI only shows the
-buttons the server lists in `allowed_actions`.
+buttons the server lists in `allowed_actions`. Admins (see above) manage teams,
+users and membership, but have no extra rights over tasks.
 
 ### What "needs attention" means
 
@@ -233,10 +271,10 @@ changes. Saving over someone else's newer change is still refused (`STALE_VERSIO
 
 | Method | Path | Notes |
 |---|---|---|
-| POST | `/api/signup` | name, email, password + `team_id` (join as member) **or** `new_team_name` (create, as lead) |
-| GET | `/api/teams` | team names for the sign-up form (no login needed) |
+| GET / POST | `/api/setup` | first-run only: is setup needed? / create the first admin (409 once any user exists) |
+| GET | `/api/teams` | team names, for choosing where to send a task (login required) |
 | POST | `/api/login`, `/api/logout` | session cookie |
-| GET | `/api/me` | user + teams with roles |
+| GET | `/api/me` | user (incl. `is_admin`, `must_change_password`) + teams with roles and statuses |
 | GET | `/api/teams/{id}/members` | assign picker |
 | GET | `/api/overview` | attention counts |
 | GET | `/api/items` | `view, team_id, status (name), status_id, priority, type, assignee(me\|unassigned\|id), q, sort(priority\|updated\|created), page, page_size≤100` |
@@ -253,7 +291,16 @@ changes. Saving over someone else's newer change is still refused (`STALE_VERSIO
 | PUT | `/api/teams/{id}/statuses/order` | `{ids: [...]}` every status once · leads only |
 | DELETE | `/api/teams/{id}/statuses/{sid}?move_to=` | custom only; `move_to` required if it has tasks (409 `STATUS_IN_USE`) |
 | GET / PATCH | `/api/profile` | account, teams with members, work summary / change display name |
-| POST | `/api/profile/password` | `{current_password, new_password}` |
+| POST | `/api/profile/password` | `{current_password, new_password}`; the only action allowed while holding a temporary password |
+| GET | `/api/admin/summary` | **admin only** (all `/api/admin/*` are): counts of teams, users, admins |
+| GET / POST | `/api/admin/teams` | list (`q`, `page`) / create `{name}` |
+| GET | `/api/admin/teams/options` | every team's id and name (for pickers) |
+| PATCH / DELETE | `/api/admin/teams/{id}` | rename `{name}` / delete `{confirm_name}` |
+| GET | `/api/admin/teams/{id}/members` | members with role and active flag |
+| GET / POST | `/api/admin/users` | list (`q`, `page`) / create `{name, email, temporary_password, is_admin?, memberships: [{team_id, role}]}` |
+| GET / PATCH | `/api/admin/users/{id}` | read / change `name`, `email`, `is_admin`, `active` (409 `LAST_ADMIN`, `SELF_DEACTIVATE`) |
+| POST | `/api/admin/users/{id}/password` | `{temporary_password}`: the user must change it at next sign-in |
+| PUT / DELETE | `/api/admin/users/{id}/teams/{team_id}` | add or change role `{role}` / remove (409 `TEAM_NEEDS_LEAD`) |
 | POST | `/api/items/{id}/comments` | Idempotency-Key |
 | GET | `/api/items/{id}/activity` | newest first, 50 per page, `before_id` cursor |
 | GET | `/api/items/counts` | tasks per status id for one team (`team_id` required) with the same filters as `/api/items` |
@@ -272,16 +319,16 @@ Errors always look like `{"error": {"code", "message", "details"}}`.
   A lead's rejection reason is asked for with the browser's prompt box.
 * **Statuses are per team.** Renaming a custom status doesn't rename it in other
   teams, and the List page's status filter matches by name across your teams.
-* **No screen for making someone a lead** (SQL only), so statuses are managed by
-  whoever created the team unless a lead is added by hand.
 * **Fonts load from Google Fonts.** Offline, the app falls back to system fonts.
 * **No notifications or background jobs.** The attention views are how people
   find what needs them; there is no email/Slack delivery.
-* **Open sign-up.** Anyone who can reach the app can create an account and join
-  any team as a member (team names are listed on the sign-up page). There is no
-  email verification, invite or approval step, and no screen for adding a second
-  team or promoting someone to lead afterwards (SQL only).
-* No password reset or SSO; login is email + password.
+* **No self-service password reset or SSO.** Login is email + password; a forgotten
+  password is reset by an admin, who then passes on a temporary one. If an admin
+  forgets theirs, another admin resets it (or use `python -m app.create_admin`).
+* **Temporary passwords are shown to the admin and passed on by hand**; there is no
+  email delivery. Users can't be deleted (only deactivated, so history stays).
+* **No audit log of admin actions** (who added or removed whom). Task history does
+  record when a removed member's tasks were unassigned, and by which admin.
 * **CSRF** protection relies on `SameSite=Lax` session cookies and JSON request
   bodies; there are no CSRF tokens.
 * **Page-number pagination.** If items change between page loads, a row can be

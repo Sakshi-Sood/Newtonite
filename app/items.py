@@ -197,7 +197,11 @@ def _team_exists(conn: Connection, team_id) -> bool:
 
 
 def _check_assignee(conn: Connection, team_id, assignee_id) -> None:
-    if assignee_id is not None and role_in_team(conn, assignee_id, team_id) is None:
+    """The assignee must be an active member of the task's team."""
+    active_member = assignee_id is not None and conn.execute(
+        """SELECT 1 FROM memberships m JOIN users u ON u.id = m.user_id
+           WHERE m.user_id = %s AND m.team_id = %s AND u.active""", (assignee_id, team_id)).fetchone()
+    if assignee_id is not None and not active_member:
         raise AppError(422, "INVALID_ASSIGNEE", "The assignee must be a member of the item's team.")
 
 
@@ -363,8 +367,7 @@ def claim_item(conn: Connection, item_id: str, user_id) -> dict:
 def assign_item(conn: Connection, item_id: str, user_id, assignee_id, expected_version: int) -> dict:
     row, role = load_item(conn, item_id, user_id)
     require(row, user_id, role, "assign")
-    if assignee_id is not None and role_in_team(conn, assignee_id, row["team_id"]) is None:
-        raise AppError(422, "INVALID_ASSIGNEE", "The assignee must be a member of the item's team.")
+    _check_assignee(conn, row["team_id"], assignee_id)
     if str(row["assignee_id"]) == str(assignee_id):
         return item_dto(conn, row, user_id, role)
     updated = conn.execute(

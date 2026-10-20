@@ -5,6 +5,7 @@
 
 import { changedFields, conflictRows } from "./edits.js";
 import { safeNext } from "./redirect.js";
+import { initAdmin } from "./admin.js";
 import { latest } from "./state.js";
 
 // ---------------------------------------------------------------- API ----
@@ -38,6 +39,9 @@ export async function api(method, path, body = null, { idempotencyKey } = {}) {
     const e = (data && data.error) || {};
     if (res.status === 401 && path !== "/api/login") {
       location.href = "/login.html?next=" + encodeURIComponent(location.pathname + location.search);
+    }
+    if (res.status === 403 && e.code === "PASSWORD_CHANGE_REQUIRED" && !location.pathname.endsWith("/change-password.html")) {
+      location.href = "/change-password.html";
     }
     throw new ApiError(res.status, e.code || `HTTP_${res.status}`, e.message || res.statusText, e.details);
   }
@@ -208,6 +212,7 @@ function flashPending() {
 // ------------------------------------------------------------ top bar ----
 
 let refreshHandler = () => location.reload();
+const setRefresh = (fn) => { refreshHandler = fn; };
 
 // Each team's statuses, from /api/me (re-read whenever a page refreshes).
 let statusesByTeam = {};
@@ -222,7 +227,8 @@ async function topbar(active) {
   const tab = (href, text, key) => el("a", { href, "aria-current": active === key ? "page" : null }, text);
   $("#topbar").replaceChildren(
     el("a", { class: "brand", href: "/" }, "Newtonite Ops"),
-    el("nav", { class: "tabs", "aria-label": "Views" }, tab("/", "List", "list"), tab("/board.html", "Board", "board")),
+    el("nav", { class: "tabs", "aria-label": "Views" }, tab("/", "List", "list"), tab("/board.html", "Board", "board"),
+      me.user.is_admin ? tab("/admin.html", "Admin", "admin") : null),
     el("span", { class: "spacer" }),
     el("button", { type: "button", id: "refresh-btn", class: "with-icon", title: "Load the latest data",
       onclick: () => refreshHandler() }, icon(REFRESH_ICON), "Refresh"),
@@ -331,17 +337,34 @@ function statusSelect(item, onUpdated) {
   return select;
 }
 
-// ------------------------------------------------------- login/signup ----
+// ------------------------------------------------------- sign-in flow ----
+
+// Where to go once signed in: an admin who is in no team has nothing to see on the
+// task pages, so they land on the admin dashboard.
+async function landingPath(user) {
+  if (user.must_change_password) return "/change-password.html";
+  if (user.is_admin) {
+    const me = await api("GET", "/api/me");
+    if (me.teams.length === 0) return "/admin.html";
+  }
+  return "/";
+}
 
 async function initLogin() {
   const form = $("#login-form");
+  try {
+    // A brand-new installation has no accounts: send the visitor to the one-time setup page.
+    if ((await api("GET", "/api/setup")).needed) { location.replace("/setup.html"); return; }
+  } catch { /* the form still works; the server will say what is wrong */ }
   form.addEventListener("submit", async (ev) => {
     ev.preventDefault();
     const data = Object.fromEntries(new FormData(form));
     await busy(form.querySelector("button"), async () => {
       try {
-        await api("POST", "/api/login", data);
-        location.href = safeNext(new URLSearchParams(location.search).get("next"), location.origin);
+        const { user } = await api("POST", "/api/login", data);
+        const next = new URLSearchParams(location.search).get("next");
+        location.href = user.must_change_password ? "/change-password.html"
+          : next ? safeNext(next, location.origin) : await landingPath(user);
       } catch (err) {
         showError($("#login-error"), err);
       }
@@ -349,42 +372,53 @@ async function initLogin() {
   });
 }
 
-async function initSignup() {
-  const form = $("#signup-form");
-  const f = form.elements;
-  const teams = await api("GET", "/api/teams");
-  for (const t of teams) f.team_id.append(el("option", { value: t.id }, t.name));
-  if (teams.length === 0) {
-    // First person in: there is nothing to join yet.
-    $("#join-option").hidden = true;
-    f.team_id.hidden = true;
-    f.team_mode.value = "create";
-  }
-  const syncMode = () => {
-    const create = f.team_mode.value === "create";
-    f.team_id.disabled = create;
-    f.new_team_name.disabled = !create;
-    f.new_team_name.required = create;
-  };
-  form.addEventListener("change", syncMode);
-  syncMode();
-
+// First run only: create the first admin on an empty database.
+async function initSetup() {
+  const form = $("#setup-form");
+  let needed = true;
+  try { needed = (await api("GET", "/api/setup")).needed; } catch { /* show the form; submitting reports errors */ }
+  if (!needed) { location.replace("/login.html"); return; }
+  form.hidden = false;
   form.addEventListener("submit", async (ev) => {
     ev.preventDefault();
-    const create = f.team_mode.value === "create";
-    const body = {
-      name: f.name.value, email: f.email.value, password: f.password.value,
-      ...(create ? { new_team_name: f.new_team_name.value } : { team_id: f.team_id.value }),
-    };
+    const f = form.elements;
+    if (f.password.value !== f.confirm.value) {
+      showError($("#setup-error"), new Error("The two passwords don't match."));
+      return;
+    }
+    await busy(form.querySelector("button"), async () => {
+      try {
+        await api("POST", "/api/setup", { name: f.name.value, email: f.email.value, password: f.password.value });
+        location.href = "/admin.html";
+      } catch (err) {
+        showError($("#setup-error"), err.code === "VALIDATION_FAILED"
+          ? new Error("Check the form: a valid email and a password of at least 8 characters.") : err);
+      }
+    });
+  });
+}
+
+// Shown to anyone whose password is a temporary one set by an admin.
+async function initChangePassword() {
+  const me = await api("GET", "/api/me");
+  if (!me.user.must_change_password) { location.replace("/"); return; }
+  const form = $("#password-form");
+  form.hidden = false;
+  $("#logout-btn").addEventListener("click", async () => { await api("POST", "/api/logout"); location.href = "/login.html"; });
+  form.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const f = form.elements;
+    if (f.new_password.value !== f.confirm.value) {
+      showError($("#password-error"), new Error("The new passwords don't match."));
+      return;
+    }
     await busy(form.querySelector("button[type=submit]"), async () => {
       try {
-        await api("POST", "/api/signup", body);
-        location.href = "/";
+        await api("POST", "/api/profile/password", { current_password: f.current_password.value, new_password: f.new_password.value });
+        location.href = await landingPath({ ...me.user, must_change_password: false });
       } catch (err) {
-        const msg = err.code === "VALIDATION_FAILED"
-          ? "Check the form: a valid email, a password of at least 8 characters, and a team."
-          : err.message;
-        showError($("#signup-error"), new Error(msg));
+        showError($("#password-error"), err.code === "VALIDATION_FAILED"
+          ? new Error("The new password needs at least 8 characters.") : err);
       }
     });
   });
@@ -472,6 +506,13 @@ async function initOverview() {
   }
 
   async function loadTiles() {
+    if (me.teams.length === 0) {
+      $("#tiles").hidden = true;
+      $("#summary").replaceChildren(...(me.user.is_admin
+        ? ["You're not in any team yet. ", el("a", { href: "/admin.html" }, "Open the admin dashboard"), " to add yourself to one."]
+        : ["You're not in a team yet. Ask an admin to add you to one."]));
+      return;
+    }
     const { counts } = await api("GET", "/api/overview");
     const active = params().get("view");
     $("#summary").textContent = summary(counts);
@@ -1367,7 +1408,8 @@ async function initProfile() {
     $("#profile-name").textContent = p.user.name;
     $("#profile-email").textContent = p.user.email;
     $("#profile-avatar").replaceChildren(avatar(p.user));
-    $("#profile-teams-count").textContent = `Member of ${p.teams.length} ${p.teams.length === 1 ? "team" : "teams"}`;
+    $("#profile-teams-count").textContent =
+      `${p.user.is_admin ? "Admin · " : ""}Member of ${p.teams.length} ${p.teams.length === 1 ? "team" : "teams"}`;
     $("#name-form").elements.name.value = p.user.name;
 
     $("#stats").replaceChildren(
@@ -1441,7 +1483,9 @@ async function initProfile() {
 // --------------------------------------------------------------- boot ----
 
 const pages = {
-  login: initLogin, signup: initSignup, overview: initOverview, board: initBoard, new: initNew, item: initItem,
+  login: initLogin, setup: initSetup, "change-password": initChangePassword, overview: initOverview,
+  board: initBoard, new: initNew, item: initItem,
+  admin: () => initAdmin({ api, el, $, topbar, flash, showError, busy, label, avatar, newKey, setRefresh }),
   profile: initProfile,
 };
 const init = pages[document.body.dataset.page];

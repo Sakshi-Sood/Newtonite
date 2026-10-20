@@ -11,6 +11,9 @@ STATEMENTS = [
     "ALTER TABLE work_items ADD COLUMN IF NOT EXISTS restricted boolean NOT NULL DEFAULT false",
     "CREATE INDEX IF NOT EXISTS work_items_created_by_idx ON work_items (created_by)",
     "ALTER TABLE work_items ADD COLUMN IF NOT EXISTS assigned_by uuid REFERENCES users (id) ON DELETE SET NULL",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin boolean NOT NULL DEFAULT false",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS active boolean NOT NULL DEFAULT true",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password boolean NOT NULL DEFAULT false",
 ]
 
 STATUS_TABLE = """
