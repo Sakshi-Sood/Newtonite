@@ -1,1 +1,6 @@
-Newtonite Software Engineering Challenge.pdf
+Newtonite SoftwareEngineering Challenge.pdf
+
+.venv/
+__pycache__/
+.env
+.superpowers/
