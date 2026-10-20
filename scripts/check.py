@@ -455,6 +455,115 @@ def check_stale_transition_409():
     expect_error(lambda: transition(it, m, "complete", 1, "fixed"), 409, "STALE_VERSION")
 
 
+# ---- Task 8: list, search, views, overview --------------------------------
+
+def ids(u, **filters) -> set:
+    from app.listing import list_items
+
+    return {r["id"] for r in call(list_items, u["id"], page_size=100, **filters)["items"]}
+
+
+def check_list_never_shows_other_teams():
+    t1, t2 = team(), team()
+    a, b = user("member", t1["id"]), user("member", t2["id"])
+    mine, theirs = item(a, t1["id"]), item(b, t2["id"])
+    seen = ids(a, team_id=str(t1["id"])) | ids(a, team_id=str(t2["id"]))
+    assert mine["id"] in seen and theirs["id"] not in seen
+
+
+def check_status_and_priority_filters():
+    t = team()
+    m = user("member", t["id"])
+    hit = item(m, t["id"], status="in_progress", priority="urgent", assignee_id=m["id"])
+    item(m, t["id"], status="open", priority="low")
+    item(m, t["id"], status="done", priority="urgent")
+    got = ids(m, team_id=str(t["id"]), status=["open", "in_progress"], priority=["urgent"])
+    assert got == {hit["id"]}, got
+
+
+def check_assignee_me_and_unassigned():
+    t = team()
+    m = user("member", t["id"])
+    mine = item(m, t["id"], assignee_id=m["id"])
+    free = item(m, t["id"])
+    assert ids(m, team_id=str(t["id"]), assignee="me") == {mine["id"]}
+    assert ids(m, team_id=str(t["id"]), assignee="unassigned") == {free["id"]}
+
+
+def check_pages_and_has_more():
+    from app.listing import list_items
+
+    t = team()
+    m = user("member", t["id"])
+    sql("""INSERT INTO work_items (team_id, title, type, priority, status, requires_approval, created_by)
+           SELECT %s, 'Paged ' || g, 'task', 'medium', 'open', false, %s FROM generate_series(1, 60) g""",
+        (t["id"], m["id"]))
+    pages = [call(list_items, m["id"], team_id=str(t["id"]), page=p, page_size=25) for p in (1, 2, 3)]
+    assert [len(p["items"]) for p in pages] == [25, 25, 10]
+    assert [p["has_more"] for p in pages] == [True, True, False]
+    all_ids = [r["id"] for p in pages for r in p["items"]]
+    assert len(set(all_ids)) == 60
+
+
+def check_search_stems():
+    t = team()
+    m = user("member", t["id"])
+    hit = item(m, t["id"], title="Refund payment failed for merchant")
+    item(m, t["id"], title="Rotate credentials")
+    assert ids(m, team_id=str(t["id"]), q="payments") == {hit["id"]}
+
+
+def check_search_garbage_ok():
+    t = team()
+    m = user("member", t["id"])
+    item(m, t["id"], title="Something ordinary")
+    for q in ['foo & (bar', '"', "   ", "!!! :* <-> |", "'; drop table users; --"]:
+        ids(m, team_id=str(t["id"]), q=q)  # must not raise
+    assert len(ids(m, team_id=str(t["id"]), q="   ")) == 1  # blank search is ignored
+
+
+def check_stale_view():
+    t = team()
+    m = user("member", t["id"])
+    old = item(m, t["id"])
+    item(m, t["id"])
+    sql("UPDATE work_items SET last_activity_at = now() - interval '4 days' WHERE id = %s", (old["id"],))
+    assert ids(m, team_id=str(t["id"]), view="stale") == {old["id"]}
+
+
+def check_awaiting_my_approval_excludes_own_and_non_lead_teams():
+    t1, t2 = team(), team()
+    lead = user("lead", t1["id"])
+    add_member(lead["id"], t2["id"], "member")
+    other = user("member", t1["id"])
+    other2 = user("member", t2["id"])
+    theirs = item(other, t1["id"], status="awaiting_approval", requires_approval=True)
+    item(lead, t1["id"], status="awaiting_approval", requires_approval=True)  # own: excluded
+    item(other2, t2["id"], status="awaiting_approval", requires_approval=True)  # not lead there: excluded
+    assert ids(lead, view="awaiting_my_approval") == {theirs["id"]}
+
+
+def check_overview_counts_match_lists():
+    from app.listing import VIEWS, overview_counts
+
+    t = team()
+    lead, m = user("lead", t["id"]), user("member", t["id"])
+    item(m, t["id"], assignee_id=lead["id"], status="in_progress")
+    item(m, t["id"], priority="urgent")
+    item(m, t["id"], status="awaiting_approval", requires_approval=True)
+    overdue = item(m, t["id"])
+    sql("UPDATE work_items SET due_at = now() - interval '1 day' WHERE id = %s", (overdue["id"],))
+    counts = call(overview_counts, lead["id"])
+    for view in VIEWS:
+        assert counts[view] == len(ids(lead, view=view)), (view, counts[view])
+    assert counts["mine"] == 1 and counts["awaiting_my_approval"] == 1 and counts["overdue"] == 1
+
+
+def check_unknown_view_400():
+    m = user()
+    expect_error(lambda: ids(m, view="everything"), 400, "INVALID_VIEW")
+
+
 # ---- runner ---------------------------------------------------------------
 
 def main() -> int:
