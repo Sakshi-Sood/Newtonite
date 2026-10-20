@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, Request, Response
 from psycopg import Connection
 from pydantic import BaseModel, StringConstraints, model_validator
 
+from app import statuses
 from app.db import Conn
 from app.errors import AppError
 
@@ -97,6 +98,7 @@ def signup(conn: Connection, data: SignupIn) -> dict:
         ).fetchone()
         if team is None:
             raise AppError(409, "TEAM_NAME_TAKEN", "A team with this name already exists. Join it instead.")
+        statuses.create_defaults(conn, team["id"])
         role = "lead"
     else:
         team = conn.execute("SELECT id FROM teams WHERE id = %s", (data.team_id,)).fetchone()
@@ -149,7 +151,8 @@ def me(user: User, conn: Conn):
            WHERE m.user_id = %s ORDER BY t.name""",
         (user["id"],),
     ).fetchall()
-    return {"user": user, "teams": teams}
+    by_team = statuses.for_user(conn, user["id"])
+    return {"user": user, "teams": [{**t, "statuses": by_team.get(str(t["id"]), [])} for t in teams]}
 
 
 @router.get("/teams/{team_id}/members")

@@ -30,6 +30,7 @@ def list_items(
     view: str | None = None,
     team_id: str | None = None,
     status: str | None = None,
+    status_id: str | None = None,
     priority: str | None = None,
     type: str | None = None,
     assignee: str | None = None,
@@ -39,8 +40,9 @@ def list_items(
     page_size: int = Query(25, ge=1, le=100),
 ):
     return listing.list_items(
-        conn, user["id"], view=view, team_id=team_id, status=_csv(status), priority=_csv(priority),
-        type=_csv(type), assignee=assignee, q=q, sort=sort, page=page, page_size=page_size,
+        conn, user["id"], view=view, team_id=team_id, status=_csv(status), status_id=status_id,
+        priority=_csv(priority), type=_csv(type), assignee=assignee, q=q, sort=sort, page=page,
+        page_size=page_size,
     )
 
 
@@ -56,6 +58,7 @@ def status_counts(
     assignee: str | None = None,
     q: str | None = None,
 ):
+    """Tasks per status id for one team (`team_id` is required: statuses are per team)."""
     return listing.status_counts(conn, user["id"], view=view, team_id=team_id, priority=_csv(priority),
                                  type=_csv(type), assignee=assignee, q=q)
 
@@ -113,13 +116,22 @@ def assign_item(
         200, items.assign_item(conn, item_id, user["id"], body.assignee_id, body.expected_version)))
 
 
-@router.post("/{item_id}/transitions")
-def transition_item(
-    item_id: str, body: items.TransitionIn, request: Request,
+@router.post("/{item_id}/status")
+def move_item(
+    item_id: str, body: items.MoveIn, request: Request,
     user: User, conn: Conn,
 ):
     return _idempotent(request, conn, user, body.model_dump(mode="json"), lambda: (
-        200, items.transition_item(conn, item_id, user["id"], body.action, body.reason, body.expected_version)))
+        200, items.move_item(conn, item_id, user["id"], body.status_id, body.expected_version)))
+
+
+@router.post("/{item_id}/approval")
+def decide_approval(
+    item_id: str, body: items.ApprovalIn, request: Request,
+    user: User, conn: Conn,
+):
+    return _idempotent(request, conn, user, body.model_dump(mode="json"), lambda: (
+        200, items.decide_approval(conn, item_id, user["id"], body.decision, body.reason, body.expected_version)))
 
 
 @router.get("/{item_id}/activity")

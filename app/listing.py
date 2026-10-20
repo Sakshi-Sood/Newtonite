@@ -10,9 +10,11 @@ import uuid
 from psycopg import Connection
 
 from app.errors import AppError
-from app.rules import ITEM_TYPES, PRIORITIES, STATUSES, allowed_actions
+from app.rules import ITEM_TYPES, PRIORITIES, allowed_actions
 
-NOT_TERMINAL = "w.status NOT IN ('done', 'cancelled')"
+# Every query below joins statuses as `s`. A task is "open" while its status isn't
+# finished and a lead hasn't rejected it.
+NOT_CLOSED = "(NOT s.finished AND w.approval IS DISTINCT FROM 'rejected')"
 VIEWS = ("mine", "unassigned_urgent", "awaiting_my_approval", "overdue", "stale", "requested_by_me")
 SORTS = {
     "priority": "w.priority, w.last_activity_at DESC, w.id",
@@ -21,13 +23,16 @@ SORTS = {
 }
 
 _LIST_COLUMNS = """
-    w.id, w.team_id, t.name AS team_name, w.title, w.type, w.priority, w.status,
-    w.requires_approval, w.restricted, w.due_at, w.assignee_id, a.name AS assignee_name, w.assigned_by,
-    w.created_by, c.name AS creator_name, w.created_at, w.updated_at,
+    w.id, w.team_id, t.name AS team_name, w.title, w.type, w.priority,
+    s.id AS status_id, s.name AS status_name, s.kind AS status_kind, s.color AS status_color,
+    s.finished AS status_finished, (s.finished OR COALESCE(w.approval = 'rejected', false)) AS closed,
+    w.requires_approval, w.approval, w.restricted, w.due_at, w.assignee_id, a.name AS assignee_name,
+    w.assigned_by, w.created_by, c.name AS creator_name, w.created_at, w.updated_at,
     w.last_activity_at, w.version, mm.role AS team_role
 """
 _LIST_FROM = """
     FROM work_items w
+    JOIN statuses s ON s.id = w.status_id
     JOIN teams t ON t.id = w.team_id
     JOIN users c ON c.id = w.created_by
     LEFT JOIN users a ON a.id = w.assignee_id
@@ -38,20 +43,20 @@ _SCOPE = "(w.team_id IN (SELECT team_id FROM memberships WHERE user_id = %s) OR 
 
 
 def view_condition(view: str, user_id) -> tuple[str, list]:
-    """SQL condition (on alias w) for one attention view. Shared by lists and counts."""
+    """SQL condition (on aliases w and s) for one attention view. Shared by lists and counts."""
     if view == "mine":
-        return f"w.assignee_id = %s AND {NOT_TERMINAL}", [user_id]
+        return f"w.assignee_id = %s AND {NOT_CLOSED}", [user_id]
     if view == "unassigned_urgent":
-        return f"w.assignee_id IS NULL AND w.priority IN ('urgent', 'high') AND {NOT_TERMINAL}", []
+        return f"w.assignee_id IS NULL AND w.priority IN ('urgent', 'high') AND {NOT_CLOSED}", []
     if view == "awaiting_my_approval":
-        return ("""w.status = 'awaiting_approval' AND w.created_by <> %s AND EXISTS (
+        return ("""w.approval = 'pending' AND w.created_by <> %s AND EXISTS (
                      SELECT 1 FROM memberships lm
                      WHERE lm.user_id = %s AND lm.team_id = w.team_id AND lm.role = 'lead')""",
                 [user_id, user_id])
     if view == "overdue":
-        return f"w.due_at < now() AND {NOT_TERMINAL}", []
+        return f"w.due_at < now() AND {NOT_CLOSED}", []
     if view == "stale":
-        return f"w.last_activity_at < now() - interval '72 hours' AND {NOT_TERMINAL}", []
+        return f"w.last_activity_at < now() - interval '72 hours' AND {NOT_CLOSED}", []
     if view == "requested_by_me":
         return ("""w.created_by = %s AND NOT EXISTS (
                      SELECT 1 FROM memberships rm WHERE rm.user_id = %s AND rm.team_id = w.team_id)""",
@@ -72,9 +77,12 @@ def _as_uuid(value: str, name: str) -> uuid.UUID:
         raise AppError(400, "INVALID_FILTER", f"{name} must be an id.")
 
 
-def _filters(user_id, *, view=None, team_id=None, status=(), priority=(), type=(), assignee=None,
-             q=None) -> tuple[list[str], list]:
-    """WHERE conditions and their parameters, shared by lists and board counts."""
+def _filters(user_id, *, view=None, team_id=None, status=(), status_id=None, priority=(), type=(),
+             assignee=None, q=None) -> tuple[list[str], list]:
+    """WHERE conditions and their parameters, shared by lists and board counts.
+
+    `status` filters by status *name* (so "Blocked" matches that status in every
+    team that has one); `status_id` picks one exact status of one team."""
     where, params = [_SCOPE], [user_id, user_id]
     if view:
         cond, p = view_condition(view, user_id)
@@ -83,8 +91,16 @@ def _filters(user_id, *, view=None, team_id=None, status=(), priority=(), type=(
     if team_id:
         where.append("w.team_id = %s")
         params.append(_as_uuid(team_id, "team_id"))
-    for column, values, allowed in (("status", status, STATUSES), ("priority", priority, PRIORITIES),
-                                    ("type", type, ITEM_TYPES)):
+    if status:
+        names = [n.strip().lower() for n in status if n.strip()]
+        if any(len(n) > 40 for n in names):
+            raise AppError(400, "INVALID_FILTER", "Status names are at most 40 characters.")
+        where.append("lower(s.name) = ANY(%s)")
+        params.append(names)
+    if status_id:
+        where.append("w.status_id = %s")
+        params.append(_as_uuid(status_id, "status_id"))
+    for column, values, allowed in (("priority", priority, PRIORITIES), ("type", type, ITEM_TYPES)):
         if values:
             _check_values(column, list(values), allowed)
             where.append(f"w.{column}::text = ANY(%s)")
@@ -128,14 +144,17 @@ def _list_dto(r: dict, user_id) -> dict:
     return {
         "id": r["id"],
         "team": {"id": r["team_id"], "name": r["team_name"]},
-        "title": r["title"], "type": r["type"], "priority": r["priority"], "status": r["status"],
-        "requires_approval": r["requires_approval"], "restricted": r["restricted"], "due_at": r["due_at"],
+        "title": r["title"], "type": r["type"], "priority": r["priority"],
+        "status": {"id": r["status_id"], "name": r["status_name"], "kind": r["status_kind"],
+                   "color": r["status_color"], "finished": r["status_finished"]},
+        "requires_approval": r["requires_approval"], "approval": r["approval"], "closed": r["closed"],
+        "restricted": r["restricted"], "due_at": r["due_at"],
         "assignee": {"id": r["assignee_id"], "name": r["assignee_name"]} if r["assignee_id"] else None,
         "created_by": {"id": r["created_by"], "name": r["creator_name"]},
         "created_at": r["created_at"], "updated_at": r["updated_at"],
         "last_activity_at": r["last_activity_at"], "version": r["version"],
         "my_role": role,
-        # Lets the list's status dropdown and the board offer only moves that will work.
+        # Lets the status dropdown and the board offer only moves that will work.
         "allowed_actions": allowed_actions(r, user_id, role),
     }
 
@@ -151,17 +170,20 @@ def list_items(conn: Connection, user_id, *, page: int = 1, page_size: int = 25,
     }
 
 
-def status_counts(conn: Connection, user_id, **filters) -> dict:
-    """How many items match the filters in each status (board column headers)."""
+def status_counts(conn: Connection, user_id, *, team_id, **filters) -> dict[str, int]:
+    """How many tasks of one team match the filters in each of its statuses
+    (board column headers), keyed by status id. Statuses with none are omitted."""
+    if not team_id:
+        raise AppError(400, "TEAM_REQUIRED", "Pick a team: every team has its own statuses.")
     filters.pop("status", None)
-    where, params = _filters(user_id, **filters)
+    filters.pop("status_id", None)
+    where, params = _filters(user_id, team_id=team_id, **filters)
     rows = conn.execute(
-        f"SELECT w.status::text AS status, count(*) AS n FROM work_items w WHERE {' AND '.join(where)} "
-        "GROUP BY w.status", params,
+        f"""SELECT w.status_id::text AS id, count(*) AS n
+            FROM work_items w JOIN statuses s ON s.id = w.status_id
+            WHERE {' AND '.join(where)} GROUP BY w.status_id""", params,
     ).fetchall()
-    counts = {s: 0 for s in STATUSES}
-    counts.update({r["status"]: r["n"] for r in rows})
-    return counts
+    return {r["id"]: r["n"] for r in rows}
 
 
 def overview_counts(conn: Connection, user_id) -> dict:
@@ -172,5 +194,6 @@ def overview_counts(conn: Connection, user_id) -> dict:
         parts.append(f"count(*) FILTER (WHERE {cond}) AS {view}")
         params += p
     return conn.execute(
-        f"SELECT {', '.join(parts)} FROM work_items w WHERE {_SCOPE}", params + [user_id, user_id]
+        f"""SELECT {', '.join(parts)} FROM work_items w JOIN statuses s ON s.id = w.status_id
+            WHERE {_SCOPE}""", params + [user_id, user_id]
     ).fetchone()

@@ -23,7 +23,7 @@ from fastapi.responses import StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 from app.auth import User
-from app.items import CHANNEL
+from app.notify import CHANNEL
 
 log = logging.getLogger("app.events")
 router = APIRouter(prefix="/api")

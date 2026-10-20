@@ -85,24 +85,12 @@ const label = (s) => {
   const t = (s || "").replaceAll("_", " ");
   return t.charAt(0).toUpperCase() + t.slice(1);
 };
-const STATUSES = ["awaiting_approval", "open", "in_progress", "blocked", "done", "cancelled"];
 const PRIORITIES = ["urgent", "high", "medium", "low"];
 const TYPES = ["customer_issue", "engineering", "payment", "incident", "compliance", "task"];
-const TERMINAL = new Set(["done", "cancelled"]);
-// Same table as app/rules.py: status -> action -> new status.
-const TRANSITIONS = {
-  awaiting_approval: { approve: "open", reject: "cancelled" },
-  open: { start: "in_progress", cancel: "cancelled" },
-  in_progress: { block: "blocked", complete: "done", cancel: "cancelled" },
-  blocked: { unblock: "in_progress", cancel: "cancelled" },
-  done: { reopen: "in_progress" },
-  cancelled: {},
-};
-const ACTION_LABEL = {
-  approve: "Approve", reject: "Reject", start: "Start work", block: "Block",
-  unblock: "Unblock", complete: "Complete", reopen: "Reopen", cancel: "Cancel",
-};
-const REASON_REQUIRED = new Set(["reject", "block", "complete", "cancel"]);
+// Colours a team can give its statuses (the --col-* variables in style.css).
+const COLORS = ["blue", "violet", "green", "teal", "amber", "orange", "red", "pink", "slate"];
+const colorVar = (c) => `var(--col-${COLORS.includes(c) ? c : "slate"})`;
+// Wording for history entries written before statuses became per-team.
 const PAST = {
   approve: "approved", reject: "rejected", start: "started work", block: "blocked",
   unblock: "unblocked", complete: "completed", reopen: "reopened", cancel: "cancelled",
@@ -117,8 +105,21 @@ function ago(iso) {
   return `${Math.floor(s / 86400)}d ago`;
 }
 const fmtDate = (iso) => (iso ? new Date(iso).toLocaleString() : "None");
-const statusBadge = (s) => el("span", { class: `badge st st-${s}` }, el("span", { class: "status-dot" }), label(s));
+const statusBadge = (s) => el("span", { class: "badge st", style: `--c: ${colorVar(s.color)}` },
+  el("span", { class: "status-dot" }), s.name);
 const prioBadge = (p) => el("span", { class: `badge pr pr-${p}` }, label(p));
+
+// A lead has to approve some tasks before their status can change.
+function approvalTag(item) {
+  if (item.approval === "pending") {
+    return el("span", { class: "tag approval-pending", title: "A team lead has to approve this task before work can start" },
+      "Awaiting approval");
+  }
+  if (item.approval === "rejected") {
+    return el("span", { class: "tag approval-rejected", title: "A team lead rejected this task" }, "Rejected");
+  }
+  return null;
+}
 
 function avatar(person) {
   if (!person) return el("span", { class: "avatar none", title: "Unassigned" }, "?");
@@ -136,12 +137,12 @@ function shortDate(iso) {
   return d.toLocaleDateString(undefined, opts);
 }
 
-// `whenFinished: false` hides the chip on done/cancelled tasks, where a due date no longer matters.
+// `whenFinished: false` hides the chip on finished tasks, where a due date no longer matters.
 function dueChip(item, { whenFinished = true } = {}) {
   if (!item.due_at) return null;
-  if (!whenFinished && TERMINAL.has(item.status)) return null;
+  if (!whenFinished && item.closed) return null;
   const ms = new Date(item.due_at).getTime() - Date.now();
-  const open = !TERMINAL.has(item.status);
+  const open = !item.closed;
   const cls = open && ms < 0 ? "due late" : open && ms < 48 * 3600e3 ? "due soon" : "due";
   const days = Math.floor(-ms / 86400e3);
   const text = open && ms < 0 ? (days >= 1 ? `Overdue ${days}d` : "Overdue today") : `Due ${shortDate(item.due_at)}`;
@@ -208,45 +209,54 @@ function flashPending() {
 
 let refreshHandler = () => location.reload();
 
+// Each team's statuses, from /api/me (re-read whenever a page refreshes).
+let statusesByTeam = {};
+function setStatuses(me) {
+  statusesByTeam = Object.fromEntries(me.teams.map((t) => [t.id, t.statuses || []]));
+}
+const teamStatuses = (teamId) => statusesByTeam[teamId] || [];
+
 async function topbar(active) {
   const me = await api("GET", "/api/me");
+  setStatuses(me);
   const tab = (href, text, key) => el("a", { href, "aria-current": active === key ? "page" : null }, text);
   $("#topbar").replaceChildren(
     el("a", { class: "brand", href: "/" }, "Newtonite Ops"),
     el("nav", { class: "tabs", "aria-label": "Views" }, tab("/", "List", "list"), tab("/board.html", "Board", "board")),
     el("span", { class: "spacer" }),
-    el("span", { class: "live", id: "live-state", title: "Whether this page hears about changes as they happen" }, "Connecting"),
     el("button", { type: "button", id: "refresh-btn", class: "with-icon", title: "Load the latest data",
       onclick: () => refreshHandler() }, icon(REFRESH_ICON), "Refresh"),
     el("a", { href: "/new.html" }, el("button", { type: "button", class: "primary", tabindex: "-1" }, "New task")),
-    el("span", { class: "me" }, avatar(me.user), el("span", { class: "me-name" }, me.user.name)),
+    el("a", { class: "me", href: "/profile.html", title: "Your profile", "aria-current": active === "profile" ? "page" : null },
+      avatar(me.user), el("span", { class: "me-name" }, me.user.name)),
     el("button", { type: "button", onclick: async () => { await api("POST", "/api/logout"); location.href = "/login.html"; } }, "Log out"),
   );
   return me;
 }
 
 // ------------------------------------------------------- live updates ----
-// The server pushes "item X changed" notices (SSE). We never redraw on our
-// own: we count changes made by other people and offer a Refresh.
+// The server pushes "something changed" notices (SSE). We never redraw on our
+// own: we count the tasks others changed and offer a Refresh.
 
 function startLive(me, { relevant, describe, onRefresh }) {
   const banner = $("#live-banner");
-  const state = $("#live-state");
   const pending = new Set(); // ids of tasks others changed (one task moved 4 times = 1)
+  let statusesChanged = false;
   let missed = false;
   let hadError = false;
 
   const show = () => {
-    if (!pending.size && !missed) { banner.hidden = true; return; }
+    if (!pending.size && !missed && !statusesChanged) { banner.hidden = true; return; }
     const text = missed
       ? "The live connection dropped for a moment, so you may have missed changes."
-      : describe(pending.size);
+      : pending.size ? describe(pending.size) + (statusesChanged ? " The team's statuses changed too." : "")
+        : "A team lead changed this team's statuses.";
     banner.replaceChildren(el("span", {}, text),
       el("button", { type: "button", class: "primary", onclick: () => refreshHandler() }, "Refresh"));
     banner.hidden = false;
   };
   refreshHandler = async () => {
-    pending.clear(); missed = false; show();
+    pending.clear(); missed = false; statusesChanged = false; show();
     await onRefresh();
   };
 
@@ -255,46 +265,35 @@ function startLive(me, { relevant, describe, onRefresh }) {
     let ev;
     try { ev = JSON.parse(msg.data); } catch { return; }
     if (ev.type === "hello") {
-      state.className = "live on"; state.textContent = "Live";
       if (hadError) { missed = true; show(); } // reconnected: we can't know what we missed
       hadError = false;
     } else if (ev.type === "resync") {
       missed = true; show();
     } else if (ev.type === "change" && ev.actor_id !== me.user.id && relevant(ev)) {
-      pending.add(ev.item_id); show();
+      if (ev.kind === "statuses") statusesChanged = true;
+      else pending.add(ev.item_id);
+      show();
     }
   };
-  source.onerror = () => {
-    hadError = true;
-    state.className = "live off"; state.textContent = "Reconnecting";
-  };
+  source.onerror = () => { hadError = true; };
 }
 
 // ------------------------------------------------------ status changes ----
 
-function nextStatuses(item) {
-  return Object.entries(TRANSITIONS[item.status] || {})
-    .filter(([action]) => item.allowed_actions.includes(action));
-}
+const canMove = (item) => item.allowed_actions.includes("move");
 
-const transitionIntents = new Map();
-// Ask for a reason when needed, send the transition, return the updated item (or null).
-async function runTransition(item, action) {
-  let reason = null;
-  if (REASON_REQUIRED.has(action)) {
-    reason = window.prompt(`${ACTION_LABEL[action]} "${item.title}": why? (required)`);
-    if (reason === null) return null;
-    if (!reason.trim()) { flash("A reason is required for this change."); return null; }
-  }
-  const k = `${item.id}:${action}:${item.version}`;
-  const it = transitionIntents.get(k) ?? intent();
-  transitionIntents.set(k, it);
+const moveIntents = new Map();
+// Move a task to `status` (any status of its team). Returns the updated task, or null.
+async function moveItem(item, status) {
+  const k = `${item.id}:${status.id}:${item.version}`;
+  const it = moveIntents.get(k) ?? intent();
+  moveIntents.set(k, it);
   try {
-    const updated = await api("POST", `/api/items/${item.id}/transitions`,
-      { action, reason, expected_version: item.version }, { idempotencyKey: it.key() });
+    const updated = await api("POST", `/api/items/${item.id}/status`,
+      { status_id: status.id, expected_version: item.version }, { idempotencyKey: it.key() });
     it.settle(null);
-    transitionIntents.delete(k);
-    flash(`"${updated.title}" ${PAST[action]}.`, true);
+    moveIntents.delete(k);
+    flash(`"${updated.title}" moved to ${status.name}.`, true);
     return updated;
   } catch (err) {
     it.settle(err);
@@ -305,26 +304,29 @@ async function runTransition(item, action) {
   }
 }
 
-// The status as a dropdown offering only the moves this user may make.
+// The status as a dropdown listing every status of the task's team, or a plain
+// pill when this user can't change it.
 function statusSelect(item, onUpdated) {
-  const moves = nextStatuses(item);
-  if (moves.length === 0) {
+  const options = teamStatuses(item.team.id);
+  if (!canMove(item) || options.length === 0) {
     const badge = statusBadge(item.status);
     badge.classList.add("status-pill");
-    badge.title = "You can't change this task's status";
+    badge.title = item.approval === "pending" ? "A team lead has to approve this task first"
+      : item.approval === "rejected" ? "A lead rejected this task"
+        : "You can't change this task's status";
     return badge;
   }
-  const select = el("select", { class: `status-select status-pill st st-${item.status}`, "aria-label": `Change status of ${item.title}` },
-    el("option", { value: "", selected: true }, label(item.status)),
-    moves.map(([action, to]) => el("option", { value: action, title: `Moves it to ${label(to)}` }, `→ ${ACTION_LABEL[action]}`)));
+  const select = el("select", { class: "status-select status-pill st", style: `--c: ${colorVar(item.status.color)}`,
+    "aria-label": `Change status of ${item.title}` },
+    options.map((s) => el("option", { value: s.id }, s.name)));
+  select.value = item.status.id;
   select.addEventListener("change", async () => {
-    const action = select.value;
-    if (!action) return;
+    const target = options.find((s) => s.id === select.value);
     select.disabled = true;
-    const updated = await runTransition(item, action);
+    const updated = target ? await moveItem(item, target) : null;
     select.disabled = false;
-    select.value = "";
     if (updated) onUpdated(updated);
+    else select.value = item.status.id; // refused or failed: show the real status again
   });
   return select;
 }
@@ -408,6 +410,7 @@ function titleCell(it) {
   return el("td", { class: "title" },
     el("a", { href: `/item.html?id=${it.id}` }, it.title),
     it.restricted ? [" ", lockTag()] : null,
+    approvalTag(it) ? [" ", approvalTag(it)] : null,
     it.my_role === "requester" ? [" ", el("span", { class: "tag" }, "Your request")] : null);
 }
 
@@ -416,7 +419,14 @@ async function initOverview() {
   flashPending();
   const form = $("#filters");
   for (const t of me.teams) form.elements.team_id.append(el("option", { value: t.id }, t.name));
-  fillSelect(form.elements.status, STATUSES);
+  // Status filter: every status name across my teams (matched by name, in any team that has it).
+  const seen = new Set();
+  for (const t of me.teams) for (const s of t.statuses) {
+    if (!seen.has(s.name.toLowerCase())) {
+      seen.add(s.name.toLowerCase());
+      form.elements.status.append(el("option", { value: s.name }, s.name));
+    }
+  }
   fillSelect(form.elements.priority, PRIORITIES);
 
   const FIELDS = ["q", "team_id", "status", "priority", "assignee", "sort"];
@@ -559,32 +569,37 @@ async function initOverview() {
 
 // --------------------------------------------------------------- board ----
 
-const COLUMN_NAMES = {
-  awaiting_approval: "Awaiting approval", open: "Open", in_progress: "In progress",
-  blocked: "Blocked", done: "Done", cancelled: "Cancelled",
-};
 const CHIPS = {
   mine: { group: "assignee", params: { assignee: "me" } },
   unassigned: { group: "assignee", params: { assignee: "unassigned" } },
   urgent: { group: "priority", params: { priority: "urgent,high" } },
   overdue: { group: "view", params: { view: "overdue" } },
-  requested: { group: "view", params: { view: "requested_by_me" } },
 };
 
 async function initBoard() {
   const me = await topbar("board");
   flashPending();
+  const board = $("#board");
+  if (me.teams.length === 0) {
+    $("#board-tools").hidden = true;
+    board.replaceChildren(el("p", { class: "empty-state" },
+      "You're not in a team yet, so there's no board to show. Join or create a team to see its tasks here."));
+    return;
+  }
+
+  // The board shows one team at a time: every team has its own statuses.
   const teamSelect = $("#board-team");
-  for (const t of me.teams) teamSelect.append(el("option", { value: t.id }, t.name));
+  teamSelect.replaceChildren(...me.teams.map((t) => el("option", { value: t.id }, t.name)));
   const url = () => new URLSearchParams(location.search);
+  const teamId = () => (me.teams.some((t) => t.id === url().get("team_id")) ? url().get("team_id") : me.teams[0].id);
+  const team = () => me.teams.find((t) => t.id === teamId());
   const activeChips = () => new Set((url().get("chips") || "").split(",").filter((c) => c in CHIPS));
 
   function filterParams() {
     const p = new URLSearchParams();
     for (const chip of activeChips()) for (const [k, v] of Object.entries(CHIPS[chip].params)) p.set(k, v);
-    const u = url();
-    if (u.get("team_id")) p.set("team_id", u.get("team_id"));
-    if (u.get("q")) p.set("q", u.get("q"));
+    p.set("team_id", teamId());
+    if (url().get("q")) p.set("q", url().get("q"));
     return p;
   }
 
@@ -614,27 +629,24 @@ async function initBoard() {
     typing = setTimeout(() => setUrl({ q: $("#board-q").value.trim() }), 300);
   });
 
-  const columns = {};   // status -> { node, list, countNode, count, page, more, loaded }
-  // Which columns are folded. A per-browser convenience; the board works without it.
-  let folded = new Set(["done", "cancelled"]);
-  try {
-    const saved = JSON.parse(localStorage.getItem("board.folded") || "null");
-    if (Array.isArray(saved)) folded = new Set(saved.filter((s) => STATUSES.includes(s)));
-  } catch { /* storage off */ }
-  const saveFolded = () => { try { localStorage.setItem("board.folded", JSON.stringify([...folded])); } catch { /* storage off */ } };
+  const columns = {};   // status id -> { status, node, list, countNode, count, page, more, foldButton, loaded }
+  // Which columns are folded, by status id. A per-browser convenience; finished statuses start folded.
+  let folded = {};
+  try { folded = JSON.parse(localStorage.getItem("board.folded.v2") || "{}") || {}; } catch { /* storage off */ }
+  const isFolded = (s) => (s.id in folded ? folded[s.id] : s.finished);
+  const saveFolded = () => { try { localStorage.setItem("board.folded.v2", JSON.stringify(folded)); } catch { /* storage off */ } };
   let dragging = null;  // { it, li } while a card is being dragged
   let loadSeq = 0;      // ignore columns from an older load
 
   function card(it) {
     const li = el("li", {
-      class: `kcard p-${it.priority}`, draggable: nextStatuses(it).length ? "true" : null, "data-id": it.id,
+      class: `kcard p-${it.priority}`, draggable: canMove(it) ? "true" : null, "data-id": it.id,
     },
       el("a", { class: "title", href: `/item.html?id=${it.id}`, draggable: "false" }, it.title),
       el("div", { class: "meta" },
         prioBadge(it.priority), el("span", { class: "tag" }, label(it.type)),
-        me.teams.length > 1 || it.my_role === "requester" ? el("span", { class: "tag" }, it.team.name) : null,
-        it.restricted ? lockTag() : null,
-        it.my_role === "requester" ? el("span", { class: "tag" }, "Your request") : null),
+        approvalTag(it),
+        it.restricted ? lockTag() : null),
       el("div", { class: "foot" }, avatar(it.assignee),
         el("span", { class: "name" }, it.assignee ? it.assignee.name : "Unassigned"), dueChip(it, { whenFinished: false })),
       statusSelect(it, (updated) => moveCard(li, it, { ...it, ...updated })),
@@ -644,11 +656,7 @@ async function initBoard() {
       ev.dataTransfer.effectAllowed = "move";
       ev.dataTransfer.setData("text/plain", it.id);
       li.classList.add("dragging");
-      const ok = new Set(nextStatuses(it).map(([, to]) => to));
-      for (const [status, col] of Object.entries(columns)) {
-        col.node.classList.toggle("drop-ok", ok.has(status));
-        col.node.classList.toggle("drop-no", !ok.has(status) && status !== it.status);
-      }
+      for (const col of Object.values(columns)) col.node.classList.toggle("drop-ok", col.status.id !== it.status.id);
     });
     li.addEventListener("dragend", () => {
       li.classList.remove("dragging");
@@ -658,8 +666,9 @@ async function initBoard() {
     return li;
   }
 
-  function setCount(status, delta) {
-    const col = columns[status];
+  function setCount(statusId, delta) {
+    const col = columns[statusId];
+    if (!col) return;
     col.count += delta;
     col.countNode.textContent = col.count;
     col.list.querySelector(".empty")?.remove();
@@ -669,43 +678,40 @@ async function initBoard() {
   // Put the card in its (new) column once the server has accepted the change.
   function moveCard(li, before, after) {
     const fresh = card(after);
-    if (after.status !== before.status) {
+    if (after.status.id !== before.status.id) {
       li.remove();
       // A folded column that hasn't loaded yet will fetch it when opened.
-      if (columns[after.status].loaded) columns[after.status].list.prepend(fresh);
-      setCount(before.status, -1);
-      setCount(after.status, +1);
+      if (columns[after.status.id]?.loaded) columns[after.status.id].list.prepend(fresh);
+      setCount(before.status.id, -1);
+      setCount(after.status.id, +1);
     } else {
       li.replaceWith(fresh);
     }
   }
 
-  async function drop(status) {
+  async function drop(statusId) {
     if (!dragging) return;
     const { it, li } = dragging;
-    const move = nextStatuses(it).find(([, to]) => to === status);
-    if (!move) {
-      if (status !== it.status) flash(`"${it.title}" can't go from ${label(it.status)} to ${label(status)} directly.`);
-      return;
-    }
+    const target = columns[statusId]?.status;
+    if (!target || target.id === it.status.id || !canMove(it)) return;
     // Show the move straight away; put it back if the server says no.
     const home = li.parentElement;
     const next = li.nextSibling;
     li.classList.add("pending");
-    columns[status].list.prepend(li);
-    const updated = await runTransition(it, move[0]);
+    columns[statusId].list.prepend(li);
+    const updated = await moveItem(it, target);
     li.classList.remove("pending");
     home.insertBefore(li, next); // back to where it was; moveCard does the real move + counts
     if (updated) moveCard(li, it, { ...it, ...updated });
   }
 
-  async function loadColumn(status, page, seq) {
-    const col = columns[status];
+  async function loadColumn(statusId, page, seq) {
+    const col = columns[statusId];
     const p = filterParams();
-    p.set("status", status);
+    p.set("status_id", statusId);
     p.set("page", page);
     p.set("page_size", 25);
-    p.set("sort", TERMINAL.has(status) ? "updated" : "priority");
+    p.set("sort", col.status.finished ? "updated" : "priority");
     const data = await api("GET", `/api/items?${p}`);
     if (seq !== loadSeq) return;
     if (page === 1) col.list.replaceChildren();
@@ -716,67 +722,162 @@ async function initBoard() {
     col.more.hidden = !data.has_more;
   }
 
-  function setFolded(status, fold) {
-    const col = columns[status];
-    fold ? folded.add(status) : folded.delete(status);
+  function setFolded(statusId, fold) {
+    const col = columns[statusId];
+    folded[statusId] = fold;
     saveFolded();
     col.node.classList.toggle("folded", fold);
     col.node.setAttribute("aria-expanded", String(!fold));
     col.node.tabIndex = fold ? 0 : -1;
-    col.node.title = fold ? `Open ${COLUMN_NAMES[status]}` : "";
+    col.node.title = fold ? `Open ${col.status.name}` : "";
     col.foldButton.hidden = fold;
-    if (!fold && !col.loaded) loadColumn(status, 1, loadSeq).catch((err) => showError($("#board-error"), err));
+    if (!fold && !col.loaded) loadColumn(statusId, 1, loadSeq).catch((err) => showError($("#board-error"), err));
+  }
+
+  function buildColumn(s, count) {
+    const list = el("ol", { class: "cards" });
+    const countNode = el("span", { class: "count" }, count);
+    const more = el("button", { type: "button", class: "more", hidden: true,
+      onclick: () => loadColumn(s.id, columns[s.id].page + 1, loadSeq) }, "Show more");
+    const foldButton = el("button", { type: "button", class: "fold", title: `Fold ${s.name}`,
+      "aria-label": `Fold ${s.name}`, onclick: (ev) => { ev.stopPropagation(); setFolded(s.id, true); } }, "‹");
+    const node = el("section", { class: "column", style: `--c: ${colorVar(s.color)}`, "aria-label": s.name },
+      el("header", {}, el("h2", { title: s.name }, s.name), countNode, foldButton), list, more);
+    // A folded column opens when clicked (or with Enter/Space).
+    node.addEventListener("click", () => { if (isFolded(s) && columns[s.id]?.node === node) setFolded(s.id, false); });
+    node.addEventListener("keydown", (ev) => {
+      if (isFolded(s) && (ev.key === "Enter" || ev.key === " ")) { ev.preventDefault(); setFolded(s.id, false); }
+    });
+    node.addEventListener("dragover", (ev) => {
+      if (dragging && canMove(dragging.it) && dragging.it.status.id !== s.id) {
+        ev.preventDefault();
+        ev.dataTransfer.dropEffect = "move";
+      }
+    });
+    node.addEventListener("drop", (ev) => { ev.preventDefault(); drop(s.id); });
+    columns[s.id] = { status: s, node, list, countNode, count, page: 1, more, foldButton, loaded: false };
+    if (isFolded(s)) {
+      node.classList.add("folded");
+      node.tabIndex = 0;
+      node.setAttribute("aria-expanded", "false");
+      node.title = `Open ${s.name}`;
+      foldButton.hidden = true;
+    }
+    return node;
   }
 
   async function load() {
     const seq = ++loadSeq;
     const chips = activeChips();
     for (const chip of document.querySelectorAll("[data-chip]")) chip.setAttribute("aria-pressed", String(chips.has(chip.dataset.chip)));
-    teamSelect.value = url().get("team_id") || "";
     if (document.activeElement !== $("#board-q")) $("#board-q").value = url().get("q") || "";
     try {
+      // A lead may have changed the statuses, so read them again on every load.
+      const fresh = await api("GET", "/api/me");
+      me.teams = fresh.teams;
+      setStatuses(me);
+      teamSelect.value = teamId();
+      $("#manage-statuses").hidden = team().role !== "lead";
       const counts = await api("GET", `/api/items/counts?${filterParams()}`);
       if (seq !== loadSeq) return;
-      $("#board").replaceChildren(...STATUSES.map((status) => {
-        const list = el("ol", { class: "cards" });
-        const countNode = el("span", { class: "count" }, counts[status]);
-        const more = el("button", { type: "button", class: "more", hidden: true,
-          onclick: () => loadColumn(status, columns[status].page + 1, loadSeq) }, "Show more");
-        const foldButton = el("button", { type: "button", class: "fold", title: `Fold ${COLUMN_NAMES[status]}`,
-          "aria-label": `Fold ${COLUMN_NAMES[status]}`, onclick: (ev) => { ev.stopPropagation(); setFolded(status, true); } }, "‹");
-        const node = el("section", { class: "column", style: `--c: var(--s-${status})`, "aria-label": COLUMN_NAMES[status] },
-          el("header", {}, el("h2", {}, COLUMN_NAMES[status]), countNode, foldButton), list, more);
-        // A folded column opens when clicked (or with Enter/Space).
-        node.addEventListener("click", () => { if (folded.has(status)) setFolded(status, false); });
-        node.addEventListener("keydown", (ev) => {
-          if (folded.has(status) && (ev.key === "Enter" || ev.key === " ")) { ev.preventDefault(); setFolded(status, false); }
-        });
-        node.addEventListener("dragover", (ev) => {
-          if (dragging && nextStatuses(dragging.it).some(([, to]) => to === status)) {
-            ev.preventDefault();
-            ev.dataTransfer.dropEffect = "move";
-          }
-        });
-        node.addEventListener("drop", (ev) => { ev.preventDefault(); drop(status); });
-        columns[status] = { node, list, countNode, count: counts[status], page: 1, more, foldButton, loaded: false };
-        if (folded.has(status)) {
-          node.classList.add("folded");
-          node.tabIndex = 0;
-          node.setAttribute("aria-expanded", "false");
-          node.title = `Open ${COLUMN_NAMES[status]}`;
-          foldButton.hidden = true;
-        }
-        return node;
-      }));
+      for (const k of Object.keys(columns)) delete columns[k];
+      const statuses = team().statuses;
+      board.replaceChildren(...statuses.map((s) => buildColumn(s, counts[s.id] || 0)));
       showError($("#board-error"), null);
-      await Promise.all(STATUSES.filter((s) => !folded.has(s)).map((s) => loadColumn(s, 1, seq)));
+      await Promise.all(statuses.filter((s) => !isFolded(s)).map((s) => loadColumn(s.id, 1, seq)));
     } catch (err) {
       showError($("#board-error"), err);
     }
   }
 
+  // ---- managing the team's statuses (leads only) ----
+  const dialog = $("#status-dialog");
+
+  // Run a change, then reload the board and redraw the dialog from fresh data.
+  async function manage(fn) {
+    try {
+      await fn();
+      showError($("#status-error"), null);
+      await load();
+      renderManager();
+    } catch (err) {
+      showError($("#status-error"), err);
+    }
+  }
+
+  const statusUrl = (s) => `/api/teams/${team().id}/statuses${s ? "/" + s.id : ""}`;
+
+  async function tryDelete(s, row) {
+    try {
+      await api("DELETE", statusUrl(s));
+      await load();
+      renderManager();
+    } catch (err) {
+      if (err.code !== "STATUS_IN_USE") { showError($("#status-error"), err); return; }
+      // Tasks are still in it: ask where they should go.
+      const pick = el("select", { "aria-label": "Move its tasks to" },
+        team().statuses.filter((x) => x.id !== s.id).map((x) => el("option", { value: x.id }, x.name)));
+      const n = err.details.task_count;
+      row.replaceChildren(
+        el("span", { class: "status-row-note" }, `${n} ${n === 1 ? "task is" : "tasks are"} in "${s.name}". Move them to:`),
+        pick,
+        el("button", { type: "button", class: "danger",
+          onclick: () => manage(() => api("DELETE", `${statusUrl(s)}?move_to=${pick.value}`)) }, "Move and delete"),
+        el("button", { type: "button", onclick: renderManager }, "Cancel"));
+    }
+  }
+
+  function renderManager() {
+    const t = team();
+    $("#status-team").textContent = t.name;
+    $("#status-list").replaceChildren(...t.statuses.map((s, i) => {
+      const isDefault = s.kind !== "custom";
+      const patch = (changes) => manage(() => api("PATCH", statusUrl(s), changes));
+      const name = el("input", { value: s.name, maxlength: 40, "aria-label": `Name of ${s.name}`, disabled: isDefault,
+        title: isDefault ? "Default statuses can't be renamed" : null });
+      name.addEventListener("change", () => patch({ name: name.value }));
+      const color = el("select", { class: "color-select", style: `--c: ${colorVar(s.color)}`, "aria-label": `Colour of ${s.name}` },
+        COLORS.map((c) => el("option", { value: c }, label(c))));
+      color.value = s.color;
+      color.addEventListener("change", () => patch({ color: color.value }));
+      const finished = el("input", { type: "checkbox", checked: s.finished, disabled: isDefault,
+        title: isDefault ? "Fixed for default statuses" : null });
+      finished.addEventListener("change", () => patch({ finished: finished.checked }));
+      const reorder = (to) => {
+        const ids = t.statuses.map((x) => x.id);
+        [ids[i], ids[to]] = [ids[to], ids[i]];
+        manage(() => api("PUT", `${statusUrl()}/order`, { ids }));
+      };
+      const row = el("li", { class: "status-row" },
+        el("span", { class: "status-dot", style: `--c: ${colorVar(s.color)}` }),
+        name, color,
+        el("label", { class: "check finished-check" }, finished, "Counts as finished"),
+        el("span", { class: "row-actions" },
+          el("button", { type: "button", disabled: i === 0, "aria-label": `Move ${s.name} left`, title: "Move left", onclick: () => reorder(i - 1) }, "←"),
+          el("button", { type: "button", disabled: i === t.statuses.length - 1, "aria-label": `Move ${s.name} right`, title: "Move right", onclick: () => reorder(i + 1) }, "→"),
+          isDefault ? el("span", { class: "tag" }, "Default")
+            : el("button", { type: "button", class: "danger", onclick: () => tryDelete(s, row) }, "Delete")));
+      return row;
+    }));
+  }
+
+  const addForm = $("#status-add");
+  addForm.elements.color.replaceChildren(...COLORS.map((c) => el("option", { value: c }, label(c))));
+  addForm.elements.color.value = "teal";
+  addForm.addEventListener("submit", (ev) => {
+    ev.preventDefault();
+    const f = addForm.elements;
+    manage(async () => {
+      await api("POST", statusUrl(), { name: f.name.value, color: f.color.value, finished: f.finished.checked });
+      addForm.reset();
+      f.color.value = "teal";
+    });
+  });
+  $("#manage-statuses").addEventListener("click", () => { renderManager(); dialog.showModal(); });
+  $("#status-close").addEventListener("click", () => dialog.close());
+
   startLive(me, {
-    relevant: () => true,
+    relevant: (ev) => ev.team_ids.includes(teamId()),
     describe: (n) => `${n} ${n === 1 ? "task has" : "tasks have"} changed since you loaded the board.`,
     onRefresh: load,
   });
@@ -881,7 +982,12 @@ function describe(entry) {
       if (p.to) return [`assigned it to ${p.to_name}`];
       return [`unassigned ${p.from_name || "the previous owner"}`];
     case "status_changed":
-      return [`${PAST[p.action] || p.action} (${label(p.from)} → ${label(p.to)})`,
+      // Older entries recorded an action ("completed"); newer ones just the two statuses.
+      return [p.action ? `${PAST[p.action] || p.action} (${label(p.from)} → ${label(p.to)})`
+        : `moved it from ${p.from} to ${p.to}`,
+        p.reason ? el("div", { class: "reason" }, `Reason: ${p.reason}`) : null];
+    case "approval":
+      return [p.decision === "approved" ? "approved this task" : "rejected this task",
         p.reason ? el("div", { class: "reason" }, `Reason: ${p.reason}`) : null];
     case "updated": {
       const parts = Object.entries(p.changes || {}).map(([field, c]) => {
@@ -943,7 +1049,7 @@ async function initItem() {
     $("#description").hidden = !!editing;
     $("#header").replaceChildren(
       el("h1", {}, item.title),
-      el("div", { class: "badges" }, statusBadge(item.status), prioBadge(item.priority),
+      el("div", { class: "badges" }, statusBadge(item.status), prioBadge(item.priority), approvalTag(item),
         el("span", { class: "tag" }, label(item.type)), el("span", { class: "tag" }, item.team.name),
         item.restricted ? lockTag("Locked: only leads and the creator edit details") : null,
         item.my_role === "requester" ? el("span", { class: "tag" }, "Your request to this team") : null),
@@ -972,13 +1078,16 @@ async function initItem() {
         el("dt", {}, "Created by"), el("dd", {}, item.created_by.name),
         el("dt", {}, "Created"), el("dd", {}, fmtDate(item.created_at)),
         el("dt", {}, "Due"), el("dd", {}, dueChip(item) || "None"),
-        el("dt", {}, "Approval"), el("dd", {}, item.requires_approval ? "Required" : "Not required"),
+        el("dt", {}, "Approval"), el("dd", {}, !item.requires_approval ? "Not required"
+          : { pending: "Waiting for a lead", approved: "Approved", rejected: "Rejected" }[item.approval] || "Required"),
         el("dt", {}, "Editing"), el("dd", {}, item.restricted ? "Leads and creator only" : "Anyone in the team"),
         el("dt", {}, "Last activity"), el("dd", {}, ago(item.last_activity_at)),
       ),
       el("div", { class: "actions" },
         can("claim") ? el("button", { type: "button", class: "primary", onclick: (ev) => claim(ev.target) }, "Take this task") : null,
-        can("edit") && !editing ? el("button", { type: "button", onclick: openEditor }, "Edit") : null),
+        can("edit") && !editing ? el("button", { type: "button", onclick: openEditor }, "Edit") : null,
+        can("approve") ? el("button", { type: "button", class: "primary", onclick: (ev) => decide("approve", ev.target) }, "Approve") : null,
+        can("reject") ? el("button", { type: "button", class: "danger", onclick: (ev) => decide("reject", ev.target) }, "Reject") : null),
       ...(assignPicker ? [el("div", { class: "actions" }, assignPicker)] : []),
     );
   }
@@ -993,7 +1102,7 @@ async function initItem() {
     const page = await api("GET", `/api/items/${encodeURIComponent(id)}/activity${q}`);
     const rows = page.entries.map((e) => {
       const d = describe(e);
-      const color = e.kind === "status_changed" ? `--c: var(--s-${e.payload.to})` : null;
+      const color = e.kind === "status_changed" && e.payload.to_color ? `--c: ${colorVar(e.payload.to_color)}` : null;
       return el("li", { class: `k-${e.kind}`, style: color },
         el("strong", {}, e.actor.name), " ", d[0],
         el("span", { class: "when", title: fmtDate(e.created_at) }, ago(e.created_at)), ...d.slice(1));
@@ -1025,6 +1134,25 @@ async function initItem() {
           flash(err.message);
         }
         render();
+      }
+      await refresh();
+    });
+  }
+
+  // A lead (never the task's creator) approves or rejects a task that needs approval.
+  async function decide(decision, button) {
+    let reason = null;
+    if (decision === "reject") {
+      reason = window.prompt("Why are you rejecting this task? (optional)");
+      if (reason === null) return;
+    }
+    await busy(button, async () => {
+      try {
+        item = await api("POST", `/api/items/${id}/approval`,
+          { decision, reason: reason || null, expected_version: item.version }, { idempotencyKey: newKey() });
+        flash(decision === "approve" ? "Task approved. Its status can change now." : "Task rejected.", true);
+      } catch (err) {
+        flash(err.code === "STALE_VERSION" ? "This task changed since you loaded it. Refresh and try again." : err.message);
       }
       await refresh();
     });
@@ -1212,17 +1340,109 @@ async function initItem() {
   // No timed polling: the server tells us when this task changes, and we
   // offer a refresh. Saving with an old version is still refused (409).
   startLive(me, {
-    relevant: (ev) => ev.item_id === id,
+    relevant: (ev) => ev.item_id === id || (ev.kind === "statuses" && item && ev.team_ids.includes(item.team.id)),
     describe: () => "Someone else just updated this task.",
-    onRefresh: refresh,
+    onRefresh: async () => {
+      const fresh = await api("GET", "/api/me"); // the team's statuses may have changed too
+      me.teams = fresh.teams;
+      setStatuses(me);
+      await refresh();
+    },
   });
   await refresh();
+}
+
+// ------------------------------------------------------------- profile ----
+
+async function initProfile() {
+  const me = await topbar("profile");
+  flashPending();
+
+  function statTile(count, text, href) {
+    const tag = href ? "a" : "div";
+    return el(tag, { class: `tile stat${href ? " link" : ""}`, href }, el("span", { class: "count" }, count), el("span", { class: "tile-label" }, text));
+  }
+
+  function render(p) {
+    $("#profile-name").textContent = p.user.name;
+    $("#profile-email").textContent = p.user.email;
+    $("#profile-avatar").replaceChildren(avatar(p.user));
+    $("#profile-teams-count").textContent = `Member of ${p.teams.length} ${p.teams.length === 1 ? "team" : "teams"}`;
+    $("#name-form").elements.name.value = p.user.name;
+
+    $("#stats").replaceChildren(
+      statTile(p.stats.assigned, "Assigned to you", "/?view=mine"),
+      statTile(p.stats.overdue, "Overdue", "/?view=overdue&assignee=me"),
+      statTile(p.stats.finished, "Finished by you"),
+      statTile(p.stats.created, "Created by you"));
+
+    $("#teams").replaceChildren(...p.teams.map((t) => el("article", { class: "card team-card" },
+      el("div", { class: "team-head" },
+        el("h3", {}, t.name),
+        el("span", { class: `tag role-${t.role}` }, t.role === "lead" ? "Lead" : "Member")),
+      el("p", { class: "muted" },
+        `${t.member_count} ${t.member_count === 1 ? "member" : "members"} · ${t.open_tasks} open of ${t.total_tasks} ${t.total_tasks === 1 ? "task" : "tasks"}`),
+      el("ul", { class: "member-list" }, t.members.map((m) => el("li", {},
+        avatar(m), el("span", {}, m.id === p.user.id ? `${m.name} (you)` : m.name),
+        m.role === "lead" ? el("span", { class: "tag" }, "Lead") : null))),
+      el("a", { href: `/board.html?team_id=${t.id}` }, "Open this team's board"))));
+  }
+
+  async function load() {
+    try {
+      render(await api("GET", "/api/profile"));
+      showError($("#profile-error"), null);
+      $("#profile-body").hidden = false;
+    } catch (err) {
+      showError($("#profile-error"), err);
+    }
+  }
+
+  const nameForm = $("#name-form");
+  nameForm.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    await busy(nameForm.querySelector("button"), async () => {
+      try {
+        const p = await api("PATCH", "/api/profile", { name: nameForm.elements.name.value });
+        render(p);
+        topbar("profile");
+        showError($("#name-error"), null);
+        flash("Name updated.", true);
+      } catch (err) {
+        showError($("#name-error"), err.code === "VALIDATION_FAILED" ? new Error("Enter a name (up to 100 characters).") : err);
+      }
+    });
+  });
+
+  const pwForm = $("#password-form");
+  pwForm.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const f = pwForm.elements;
+    if (f.new_password.value !== f.confirm.value) {
+      showError($("#password-error"), new Error("The new passwords don't match."));
+      return;
+    }
+    await busy(pwForm.querySelector("button"), async () => {
+      try {
+        await api("POST", "/api/profile/password", { current_password: f.current_password.value, new_password: f.new_password.value });
+        pwForm.reset();
+        showError($("#password-error"), null);
+        flash("Password changed.", true);
+      } catch (err) {
+        showError($("#password-error"), err.code === "VALIDATION_FAILED" ? new Error("The new password needs at least 8 characters.") : err);
+      }
+    });
+  });
+
+  startLive(me, { relevant: () => false, describe: () => "", onRefresh: load });
+  await load();
 }
 
 // --------------------------------------------------------------- boot ----
 
 const pages = {
   login: initLogin, signup: initSignup, overview: initOverview, board: initBoard, new: initNew, item: initItem,
+  profile: initProfile,
 };
 const init = pages[document.body.dataset.page];
 if (init) init().catch((err) => console.error(err));

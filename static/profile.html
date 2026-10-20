@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Your profile · Newtonite Ops</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600..800&family=Figtree:wght@400;500;600;700&display=swap">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body data-page="profile">
+  <header id="topbar"></header>
+  <main class="profile-page">
+    <div id="live-banner" class="banner" hidden></div>
+    <div id="flash" class="flash" hidden></div>
+
+    <p id="profile-error" class="error" hidden></p>
+    <!-- Hidden until the profile has loaded, so the empty forms never flash on screen. -->
+    <div id="profile-body" hidden>
+    <section class="profile-head" aria-labelledby="profile-name">
+      <span id="profile-avatar" class="profile-avatar"></span>
+      <div>
+        <h1 id="profile-name"></h1>
+        <p class="muted"><span id="profile-email"></span> · <span id="profile-teams-count"></span></p>
+      </div>
+    </section>
+
+    <section aria-label="Your work">
+      <h2>Your work</h2>
+      <div id="stats" class="tiles"></div>
+    </section>
+
+    <section aria-label="Your teams">
+      <h2>Your teams</h2>
+      <div id="teams" class="team-grid"></div>
+    </section>
+
+    <section class="settings" aria-label="Account settings">
+      <form id="name-form" class="card stack">
+        <h2>Display name</h2>
+        <label>Name <input name="name" maxlength="100" required autocomplete="name"></label>
+        <p id="name-error" class="error" hidden></p>
+        <div><button type="submit" class="primary">Save name</button></div>
+      </form>
+
+      <form id="password-form" class="card stack">
+        <h2>Change password</h2>
+        <label>Current password <input name="current_password" type="password" autocomplete="current-password" required></label>
+        <label>New password <input name="new_password" type="password" minlength="8" maxlength="200" autocomplete="new-password" required>
+          <span class="hint">At least 8 characters.</span></label>
+        <label>Confirm new password <input name="confirm" type="password" autocomplete="new-password" required></label>
+        <p id="password-error" class="error" hidden></p>
+        <div><button type="submit" class="primary">Change password</button></div>
+      </form>
+    </section>
+    </div>
+  </main>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

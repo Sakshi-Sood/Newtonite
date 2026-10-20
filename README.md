@@ -38,11 +38,20 @@ psycopg 3 with plain SQL · plain HTML/CSS/JavaScript (no build step).
 ## Run
 
 ```bash
-.venv\Scripts\python -m app.migrate     # once, after pulling changes: adds new columns, keeps your data
+.venv\Scripts\python -m app.migrate     # once, after pulling changes: keeps your data (see below)
 .venv\Scripts\python -m uvicorn app.main:app --reload --timeout-graceful-shutdown 3
 ```
 
 Open <http://localhost:8000>. Interactive API docs are at <http://localhost:8000/docs>.
+
+### Upgrading an existing database
+
+`python -m app.migrate` is safe to run any number of times. The first time after
+this change it converts the six old fixed statuses into per-team statuses:
+open → To do, in progress → In progress, done → Completed, awaiting approval →
+To do with approval pending, and **Blocked** / **Cancelled** become custom statuses
+(Cancelled counts as finished) in teams that had such tasks. Take a backup first
+if the data matters (`pg_dump`).
 
 ### Creating accounts
 
@@ -73,7 +82,7 @@ on the same Payments item: claim it at the same moment, or edit it at the same t
 
 ```bash
 .venv\Scripts\python -m unittest -v          # workflow + permission rules (no database)
-.venv\Scripts\python scripts\check.py        # 59 behaviour checks against the database
+.venv\Scripts\python scripts\check.py        # 68 behaviour checks against the database
 node tests/test_edits.mjs                    # edit/conflict merge rules (frontend, no deps)
 node tests/test_redirect.mjs                 # post-login redirect stays on this site
 node tests/test_state.mjs                    # an older server response never replaces newer state
@@ -110,31 +119,35 @@ attention views. Add `-v` for tracebacks.
 Every request runs in **one database transaction**: the change, its activity
 row and its idempotency record commit together or not at all.
 
-### Workflow
+### Statuses
 
-```
-awaiting_approval ──approve──▶ open ──start──▶ in_progress ──complete──▶ done
-        │                                       │      ▲                   │
-      reject                                  block  unblock            reopen
-        ▼                                       ▼      │                   │
-    cancelled                                  blocked ┘    (back to in_progress)
+Every team has its own board columns (statuses):
 
-cancel: open | in_progress | blocked ──▶ cancelled
-```
+* Three **defaults** that can't be renamed or deleted: **To do**, **In progress**
+  and **Completed** (Completed counts as finished).
+* Any number of **custom** statuses. Team **leads** add, rename, recolour,
+  reorder and delete them with **Manage statuses** on the board. Members can read them.
+* A status can be marked **counts as finished**. Tasks in a finished status can't
+  be edited, claimed or reassigned, and drop out of *Assigned to me*, *Overdue*
+  and *No activity*.
+* Deleting a custom status that still has tasks asks where they should go; each
+  moved task gets a history entry.
+* A new task starts in **To do**. If you move a task to another team it keeps its
+  place: same default status, or the custom status with the same name, otherwise To do.
 
-| Action | From | To | Needs |
-|---|---|---|---|
-| approve / reject | awaiting_approval | open / cancelled | a lead who didn't create it; reject needs a reason |
-| start | open | in_progress | an assignee |
-| block / unblock | in_progress ↔ blocked | | block needs a reason |
-| complete | in_progress | done | a reason (resolution note) |
-| reopen | done | in_progress | |
-| cancel | open, in_progress, blocked | cancelled | a lead, and a reason |
+**Moving a task:** the assignee, or any lead of the team, can move it to *any*
+status of its team, in any order, by drag and drop or the status dropdown. There
+are no required reasons.
 
-* Items flagged "needs approval" start in `awaiting_approval`; others start `open`.
-* `start` needs an assignee. `reject`, `block`, `complete` and `cancel` need a
-  reason, which is kept in the history ("why was this decided?").
-* `done` and `cancelled` are final (a `done` item can be reopened).
+### Approval
+
+Ticking *Needs a lead's approval* when creating a task adds an approval step:
+
+* Until a lead approves it, **nobody can change its status** (it stays in To do).
+* A lead approves or rejects it from the task page. **The task's creator can never
+  approve or reject their own task**, even if they're a lead.
+* A **rejected** task is closed and locked, but another lead can still approve it later.
+* *Awaiting my approval* on the List page lists the pending tasks in teams you lead.
 
 ### Who can do what
 
@@ -148,10 +161,10 @@ team and a member in another.
 | Edit details, move to another team | | ✓ | ✓ unless **restricted** | ✓ |
 | Tick / untick "Restrict editing" | | ✓ (they're the creator) | only the creator | ✗ (leads can always edit, so they don't get the option) |
 | Claim an unassigned item | | | ✓ | ✓ |
-| Start / block / unblock / complete / reopen | | | only if assigned to them | ✓ any item |
+| Change status (any status of the team) | | | only if assigned to them | ✓ any task |
 | Assign when creating | | | ✓ anyone in the team | ✓ anyone in the team |
 | Reassign later | | | only if **they** made the current assignment | ✓ |
-| Cancel | | | | ✓ |
+| Manage the team's statuses | | | | ✓ |
 | Approve / reject | | | | ✓, **but never their own item** |
 
 * **Restrict editing** (a checkbox on create and edit, shown to a creator who isn't
@@ -185,23 +198,36 @@ The overview tiles and the `view=` list filter use the same SQL:
 ### List and board
 
 The header has two views of the same tasks: **List** (attention tiles, filters,
-and a status dropdown on every row) and **Board** (one column per status). On
-the board, drag a card to another column to change its status. While you drag,
-columns the card can't move to fade out, and moves that need a reason (block,
-complete, cancel, reject) ask for one. Every card also has the same status
-dropdown, for keyboard and touch use. Quick filter chips: *My tasks*,
-*Unassigned*, *Urgent & high*, *Overdue*, *Requested by me*, plus team and
-search. Columns load 25 cards at a time, and their counts come from the database.
+and a status dropdown on every row) and **Board** (one column per status).
+
+* **Drag and drop:** drag a card to another column to change its status. Every
+  card also has a status dropdown, for keyboard and touch use.
+* **One team at a time:** each team has its own statuses, so the board has a team
+  picker. Leads of the team also see **Manage statuses**.
+* **Fixed width, scrolls sideways:** columns have a fixed width, so a board with
+  many statuses scrolls sideways, and cards keep their width when other columns fold.
+* **Folding:** a folded column shows only its name and count, and you can still
+  drop cards on it. Finished statuses start folded; click a column to open it or
+  use its ‹ button to fold it. The browser remembers your choice.
+* **Quick filters:** *My tasks*, *Unassigned*, *Urgent & high*, *Overdue*, plus search.
+  Columns load 25 cards at a time, and their counts come from the database.
+
+### Profile
+
+Click your name in the header. The profile page shows your account (name, email),
+a summary of your work (assigned to you, overdue, finished by you, created by you),
+and each team you're in with your role, its members and its task counts. You can
+change your display name and your password (the current password is required).
 
 ### Live updates
 
-Pages never refresh on their own. When someone else changes a task you can see,
-the server pushes a small notice (Server-Sent Events). The page then shows
-*"3 tasks have changed since you loaded this board" · Refresh* (one task changed
-several times counts once) and reloads only when you click. The **Refresh** button in the header works at any time. The dot
-next to it shows whether the live connection is up. After the connection drops
-and comes back, the page tells you that you may have missed changes. Saving
-over someone else's newer change is still refused, as before (`STALE_VERSION`).
+Pages never refresh on their own. When someone else changes a task you can see (or
+a lead changes your team's statuses), the server pushes a small notice
+(Server-Sent Events). The page then shows *"3 tasks have changed since you loaded
+this board" · Refresh* (one task changed several times counts once) and reloads
+only when you click. The **Refresh** button in the header works at any time. After
+the connection drops and comes back, the page tells you that you may have missed
+changes. Saving over someone else's newer change is still refused (`STALE_VERSION`).
 
 ## API summary
 
@@ -213,16 +239,24 @@ over someone else's newer change is still refused, as before (`STALE_VERSION`).
 | GET | `/api/me` | user + teams with roles |
 | GET | `/api/teams/{id}/members` | assign picker |
 | GET | `/api/overview` | attention counts |
-| GET | `/api/items` | `view, team_id, status, priority, type, assignee(me\|unassigned\|id), q, sort(priority\|updated\|created), page, page_size≤100` |
+| GET | `/api/items` | `view, team_id, status (name), status_id, priority, type, assignee(me\|unassigned\|id), q, sort(priority\|updated\|created), page, page_size≤100` |
 | POST | `/api/items` | create (any team; optional `assignee_id`, `restricted`) · **Idempotency-Key required** |
 | GET | `/api/items/{id}` | includes `version` and `allowed_actions` |
 | PATCH | `/api/items/{id}` | details, `restricted`, `team_id` (move), `assignee_id` · `expected_version` required → 409 `STALE_VERSION` if outdated |
 | POST | `/api/items/{id}/claim` | 409 `ALREADY_CLAIMED` names the owner · Idempotency-Key |
 | POST | `/api/items/{id}/assign` | lead only · `expected_version` · Idempotency-Key |
-| POST | `/api/items/{id}/transitions` | `{action, reason?, expected_version}` · Idempotency-Key |
+| POST | `/api/items/{id}/status` | `{status_id, expected_version}` · assignee or lead · Idempotency-Key |
+| POST | `/api/items/{id}/approval` | `{decision: approve\|reject, reason?, expected_version}` · a lead who isn't the creator · Idempotency-Key |
+| GET | `/api/teams/{id}/statuses` | the team's statuses, in board order |
+| POST | `/api/teams/{id}/statuses` | `{name, color, finished}` · leads only |
+| PATCH | `/api/teams/{id}/statuses/{sid}` | rename, recolour, `finished` · leads only (defaults: colour only) |
+| PUT | `/api/teams/{id}/statuses/order` | `{ids: [...]}` every status once · leads only |
+| DELETE | `/api/teams/{id}/statuses/{sid}?move_to=` | custom only; `move_to` required if it has tasks (409 `STATUS_IN_USE`) |
+| GET / PATCH | `/api/profile` | account, teams with members, work summary / change display name |
+| POST | `/api/profile/password` | `{current_password, new_password}` |
 | POST | `/api/items/{id}/comments` | Idempotency-Key |
 | GET | `/api/items/{id}/activity` | newest first, 50 per page, `before_id` cursor |
-| GET | `/api/items/counts` | tasks per status for the same filters as `/api/items` (board column counts) |
+| GET | `/api/items/counts` | tasks per status id for one team (`team_id` required) with the same filters as `/api/items` |
 | GET | `/api/events` | live-update stream (`text/event-stream`): `{type: "change", item_id, team_ids, actor_id, kind}` |
 
 Errors always look like `{"error": {"code", "message", "details"}}`.
@@ -234,8 +268,12 @@ Errors always look like `{"error": {"code", "message", "details"}}`.
   Notices about tasks moved out of your team stop when you reload the page.
 * **Uvicorn waits for open live-update streams on shutdown**, which is why the
   run command includes `--timeout-graceful-shutdown 3`.
-* **Reasons are asked for with the browser's prompt box**, and dragging cards
-  needs a mouse (on touch screens, use the card's status dropdown).
+* **Dragging cards needs a mouse.** On touch screens use the card's status dropdown.
+  A lead's rejection reason is asked for with the browser's prompt box.
+* **Statuses are per team.** Renaming a custom status doesn't rename it in other
+  teams, and the List page's status filter matches by name across your teams.
+* **No screen for making someone a lead** (SQL only), so statuses are managed by
+  whoever created the team unless a lead is added by hand.
 * **Fonts load from Google Fonts.** Offline, the app falls back to system fonts.
 * **No notifications or background jobs.** The attention views are how people
   find what needs them; there is no email/Slack delivery.

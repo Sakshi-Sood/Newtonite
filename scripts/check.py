@@ -43,7 +43,23 @@ def sql(query: str, params=()) -> list[dict]:
 # ---- fixtures -------------------------------------------------------------
 
 def team() -> dict:
-    return sql("INSERT INTO teams (name) VALUES (%s) RETURNING *", (f"check-{RUN}-{_next()}",))[0]
+    from app.statuses import create_defaults
+
+    row = sql("INSERT INTO teams (name) VALUES (%s) RETURNING *", (f"check-{RUN}-{_next()}",))[0]
+    with tx() as conn:
+        create_defaults(conn, row["id"])  # To do / In progress / Completed
+    return row
+
+
+def status_id(team_id, kind: str = "todo"):
+    return sql("SELECT id FROM statuses WHERE team_id = %s AND kind = %s", (team_id, kind))[0]["id"]
+
+
+def custom_status(team_id, name: str, finished: bool = False) -> dict:
+    return sql("""INSERT INTO statuses (team_id, name, kind, color, finished, position)
+                  VALUES (%s, %s, 'custom', 'slate', %s,
+                          (SELECT coalesce(max(position), 0) + 1 FROM statuses WHERE team_id = %s)) RETURNING *""",
+               (team_id, name, finished, team_id))[0]
 
 
 _PASSWORD_HASH = None
@@ -68,10 +84,12 @@ def add_member(user_id, team_id, role: str) -> None:
     sql("INSERT INTO memberships (user_id, team_id, role) VALUES (%s, %s, %s)", (user_id, team_id, role))
 
 
-def item(created_by: dict, team_id, **overrides) -> dict:
+def item(created_by: dict, team_id, status: str = "todo", **overrides) -> dict:
+    """Insert a task straight into the database. `status` is a default kind
+    (todo / in_progress / completed); pass status_id=... for a custom status."""
     fields = {
         "team_id": team_id, "title": f"Check item {_next()}", "description": "",
-        "type": "task", "priority": "medium", "status": "open",
+        "type": "task", "priority": "medium", "status_id": status_id(team_id, status),
         "requires_approval": False, "created_by": created_by["id"],
     }
     fields.update(overrides)
@@ -101,7 +119,7 @@ def cleanup() -> None:
 def check_schema():
     names = {r["table_name"] for r in sql(
         "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'")}
-    expected = {"users", "teams", "memberships", "work_items", "activity", "idempotency_keys"}
+    expected = {"users", "teams", "memberships", "statuses", "work_items", "activity", "idempotency_keys"}
     assert expected <= names, f"missing tables: {expected - names}"
     rows = sql("SELECT unnest(enum_range(NULL::item_priority))::text AS p")
     assert [r["p"] for r in rows] == ["urgent", "high", "medium", "low"]
@@ -142,14 +160,16 @@ def check_create_open_item():
     t = team()
     m = user("member", t["id"])
     it = create(m, t["id"])
-    assert it["status"] == "open" and it["version"] == 1, it
+    assert it["status"]["name"] == "To do" and it["status"]["kind"] == "todo" and it["version"] == 1, it
+    assert it["approval"] is None and not it["closed"]
     assert activity_kinds(it["id"]) == ["created"]
 
 
 def check_requires_approval_starts_awaiting():
     t = team()
     m = user("member", t["id"])
-    assert create(m, t["id"], requires_approval=True)["status"] == "awaiting_approval"
+    it = create(m, t["id"], requires_approval=True)
+    assert it["approval"] == "pending" and it["status"]["name"] == "To do", it
 
 
 def check_outsider_cannot_see_other_peoples_items():
@@ -205,7 +225,7 @@ def check_member_actions_on_unassigned_open():
     t = team()
     m = user("member", t["id"])
     acts = create(m, t["id"])["allowed_actions"]
-    assert "claim" in acts and "start" not in acts and "assign" not in acts, acts
+    assert "claim" in acts and "move" not in acts and "assign" not in acts, acts
 
 
 # ---- Task 5: idempotency --------------------------------------------------
@@ -345,12 +365,12 @@ def check_noop_patch_no_activity():
     assert out["version"] == 1 and activity_kinds(it["id"]) == ["created"]
 
 
-def check_patch_cancelled_item_403():
+def check_patch_finished_item_403():
     from app.items import update_item
 
     t = team()
     m = user("member", t["id"])
-    it = item(m, t["id"], status="cancelled")
+    it = item(m, t["id"], status="completed")
     expect_error(lambda: call(update_item, it["id"], m["id"], 1, {"title": "x"}), 403, "FORBIDDEN")
 
 
@@ -405,58 +425,97 @@ def check_member_cannot_assign_403():
     expect_error(lambda: call(assign_item, it["id"], m["id"], other["id"], 1), 403, "FORBIDDEN")
 
 
-def transition(it, u, action, version, reason=None):
-    from app.items import transition_item
+def move(it, u, to_status_id, version):
+    from app.items import move_item
 
-    return call(transition_item, it["id"], u["id"], action, reason, version)
+    return call(move_item, it["id"], u["id"], to_status_id, version)
 
 
-def check_open_to_complete_422_invalid_transition():
+def decide(it, u, decision, version, reason=None):
+    from app.items import decide_approval
+
+    return call(decide_approval, it["id"], u["id"], decision, reason, version)
+
+
+def check_move_to_any_status_by_assignee_or_lead():
     t = team()
-    lead = user("lead", t["id"])
-    it = create(lead, t["id"])
-    expect_error(lambda: transition(it, lead, "complete", 1, "done"), 422, "INVALID_TRANSITION")
+    owner, other, lead = user("member", t["id"]), user("member", t["id"]), user("lead", t["id"])
+    it = item(owner, t["id"], assignee_id=owner["id"])
+    out = move(it, owner, status_id(t["id"], "completed"), 1)  # To do -> Completed directly: any order
+    assert out["status"]["kind"] == "completed" and out["version"] == 2 and out["closed"]
+    expect_error(lambda: move(it, other, status_id(t["id"], "in_progress"), 2), 403, "FORBIDDEN")
+    back = move(it, lead, status_id(t["id"], "in_progress"), 2)  # a lead reopens it
+    assert back["status"]["kind"] == "in_progress" and not back["closed"]
+    moves = [r["payload"]["to"] for r in sql(
+        "SELECT payload FROM activity WHERE work_item_id = %s AND kind = 'status_changed' ORDER BY id", (it["id"],))]
+    assert moves == ["Completed", "In progress"], moves
 
 
-def check_start_without_assignee_422():
-    t = team()
-    lead = user("lead", t["id"])
-    it = create(lead, t["id"])
-    expect_error(lambda: transition(it, lead, "start", 1), 422, "ASSIGNEE_REQUIRED")
+def check_move_rejects_other_teams_status_and_ignores_same_status():
+    a, b = team(), team()
+    m = user("member", a["id"])
+    it = item(m, a["id"], assignee_id=m["id"])
+    expect_error(lambda: move(it, m, status_id(b["id"], "completed"), 1), 422, "INVALID_STATUS")
+    same = move(it, m, status_id(a["id"], "todo"), 1)
+    assert same["version"] == 1 and activity_kinds(it["id"]) == []
 
 
-def check_block_without_reason_400():
-    t = team()
-    m = user("member", t["id"])
-    it = item(m, t["id"], status="in_progress", assignee_id=m["id"])
-    expect_error(lambda: transition(it, m, "block", 1, "   "), 400, "REASON_REQUIRED")
-    assert transition(it, m, "block", 1, "Waiting on bank")["status"] == "blocked"
-
-
-def check_creator_lead_cannot_approve_other_lead_can():
-    t = team()
-    lead1, lead2 = user("lead", t["id"]), user("lead", t["id"])
-    it = create(lead1, t["id"], requires_approval=True)
-    expect_error(lambda: transition(it, lead1, "approve", 1), 403, "FORBIDDEN")
-    assert transition(it, lead2, "approve", 1)["status"] == "open"
-
-
-def check_non_assignee_member_cannot_complete():
-    t = team()
-    owner, other = user("member", t["id"]), user("member", t["id"])
-    it = item(owner, t["id"], status="in_progress", assignee_id=owner["id"])
-    expect_error(lambda: transition(it, other, "complete", 1, "fixed"), 403, "FORBIDDEN")
-    assert transition(it, owner, "complete", 1, "fixed")["status"] == "done"
-
-
-def check_stale_transition_409():
+def check_stale_move_409():
     from app.items import update_item
 
     t = team()
     m = user("member", t["id"])
     it = item(m, t["id"], status="in_progress", assignee_id=m["id"])
     call(update_item, it["id"], m["id"], 1, {"priority": "urgent"})
-    expect_error(lambda: transition(it, m, "complete", 1, "fixed"), 409, "STALE_VERSION")
+    expect_error(lambda: move(it, m, status_id(t["id"], "completed"), 1), 409, "STALE_VERSION")
+
+
+def check_pending_approval_blocks_moves_until_another_lead_approves():
+    t = team()
+    lead1, lead2, m = user("lead", t["id"]), user("lead", t["id"]), user("member", t["id"])
+    it = create(lead1, t["id"], requires_approval=True)
+    assert it["approval"] == "pending" and "move" not in it["allowed_actions"]
+    expect_error(lambda: move(it, lead1, status_id(t["id"], "in_progress"), 1), 422, "APPROVAL_REQUIRED")
+    expect_error(lambda: decide(it, lead1, "approve", 1), 403, "FORBIDDEN")  # creator
+    expect_error(lambda: decide(it, m, "approve", 1), 403, "FORBIDDEN")      # not a lead
+    ok = decide(it, lead2, "approve", 1)
+    assert ok["approval"] == "approved" and ok["version"] == 2
+    assert move(it, lead1, status_id(t["id"], "in_progress"), 2)["status"]["kind"] == "in_progress"
+
+
+def check_reject_closes_the_task_and_a_lead_can_still_approve_later():
+    t = team()
+    lead1, lead2 = user("lead", t["id"]), user("lead", t["id"])
+    it = create(lead1, t["id"], requires_approval=True)
+    out = decide(it, lead2, "reject", 1, "Out of budget")
+    assert out["approval"] == "rejected" and out["closed"] and "move" not in out["allowed_actions"]
+    payload = sql("SELECT payload FROM activity WHERE work_item_id = %s AND kind = 'approval'", (it["id"],))[0]["payload"]
+    assert payload == {"decision": "rejected", "reason": "Out of budget"}, payload
+    expect_error(lambda: decide(it, lead2, "reject", 2), 422, "INVALID_APPROVAL_STATE")
+    again = decide(it, lead2, "approve", 2)
+    assert again["approval"] == "approved" and not again["closed"]
+
+
+def check_approval_on_a_task_that_needs_none_422():
+    t = team()
+    lead1, lead2 = user("lead", t["id"]), user("lead", t["id"])
+    it = create(lead1, t["id"])
+    expect_error(lambda: decide(it, lead2, "approve", 1), 422, "INVALID_APPROVAL_STATE")
+
+
+def check_finished_custom_status_closes_tasks_and_leaves_attention_views():
+    from app.items import update_item
+
+    t = team()
+    m = user("member", t["id"])
+    cancelled = custom_status(t["id"], "Cancelled", finished=True)
+    it = item(m, t["id"], assignee_id=m["id"])
+    sql("UPDATE work_items SET due_at = now() - interval '1 day' WHERE id = %s", (it["id"],))
+    assert it["id"] in ids(m, view="mine") and it["id"] in ids(m, view="overdue")
+    out = move(it, m, cancelled["id"], 1)
+    assert out["closed"] and out["status"]["name"] == "Cancelled"
+    assert it["id"] not in ids(m, view="mine") and it["id"] not in ids(m, view="overdue")
+    expect_error(lambda: call(update_item, it["id"], m["id"], 2, {"title": "x"}), 403, "FORBIDDEN")
 
 
 # ---- Task 8: list, search, views, overview --------------------------------
@@ -479,10 +538,12 @@ def check_status_and_priority_filters():
     t = team()
     m = user("member", t["id"])
     hit = item(m, t["id"], status="in_progress", priority="urgent", assignee_id=m["id"])
-    item(m, t["id"], status="open", priority="low")
-    item(m, t["id"], status="done", priority="urgent")
-    got = ids(m, team_id=str(t["id"]), status=["open", "in_progress"], priority=["urgent"])
+    item(m, t["id"], status="todo", priority="low")
+    item(m, t["id"], status="completed", priority="urgent")
+    got = ids(m, team_id=str(t["id"]), status=["to do", "In Progress"], priority=["urgent"])  # names, any case
     assert got == {hit["id"]}, got
+    exact = ids(m, team_id=str(t["id"]), status_id=str(status_id(t["id"], "in_progress")))
+    assert exact == {hit["id"]}, exact
 
 
 def check_assignee_me_and_unassigned():
@@ -499,9 +560,9 @@ def check_pages_and_has_more():
 
     t = team()
     m = user("member", t["id"])
-    sql("""INSERT INTO work_items (team_id, title, type, priority, status, requires_approval, created_by)
-           SELECT %s, 'Paged ' || g, 'task', 'medium', 'open', false, %s FROM generate_series(1, 60) g""",
-        (t["id"], m["id"]))
+    sql("""INSERT INTO work_items (team_id, title, type, priority, status_id, requires_approval, created_by)
+           SELECT %s, 'Paged ' || g, 'task', 'medium', %s, false, %s FROM generate_series(1, 60) g""",
+        (t["id"], status_id(t["id"]), m["id"]))
     pages = [call(list_items, m["id"], team_id=str(t["id"]), page=p, page_size=25) for p in (1, 2, 3)]
     assert [len(p["items"]) for p in pages] == [25, 25, 10]
     assert [p["has_more"] for p in pages] == [True, True, False]
@@ -541,9 +602,10 @@ def check_awaiting_my_approval_excludes_own_and_non_lead_teams():
     add_member(lead["id"], t2["id"], "member")
     other = user("member", t1["id"])
     other2 = user("member", t2["id"])
-    theirs = item(other, t1["id"], status="awaiting_approval", requires_approval=True)
-    item(lead, t1["id"], status="awaiting_approval", requires_approval=True)  # own: excluded
-    item(other2, t2["id"], status="awaiting_approval", requires_approval=True)  # not lead there: excluded
+    theirs = item(other, t1["id"], approval="pending", requires_approval=True)
+    item(lead, t1["id"], approval="pending", requires_approval=True)  # own: excluded
+    item(other2, t2["id"], approval="pending", requires_approval=True)  # not lead there: excluded
+    item(other, t1["id"], approval="approved", requires_approval=True)  # already decided: excluded
     assert ids(lead, view="awaiting_my_approval") == {theirs["id"]}
 
 
@@ -554,7 +616,7 @@ def check_overview_counts_match_lists():
     lead, m = user("lead", t["id"]), user("member", t["id"])
     item(m, t["id"], assignee_id=lead["id"], status="in_progress")
     item(m, t["id"], priority="urgent")
-    item(m, t["id"], status="awaiting_approval", requires_approval=True)
+    item(m, t["id"], approval="pending", requires_approval=True)
     overdue = item(m, t["id"])
     sql("UPDATE work_items SET due_at = now() - interval '1 day' WHERE id = %s", (overdue["id"],))
     counts = call(overview_counts, lead["id"])
@@ -663,7 +725,7 @@ def check_restricted_item_details_locked_for_members_not_status():
     expect_error(lambda: call(update_item, it["id"], worker["id"], 1, {"title": "nope"}), 403, "FORBIDDEN")
     v = call(update_item, it["id"], creator["id"], 1, {"title": "creator edit"})["version"]
     v = call(update_item, it["id"], lead["id"], v, {"title": "lead edit"})["version"]
-    assert transition(it, worker, "start", v)["status"] == "in_progress"  # status not locked
+    assert move(it, worker, status_id(t["id"], "in_progress"), v)["status"]["kind"] == "in_progress"  # not locked
 
 
 def check_only_leads_and_creator_change_restriction():
@@ -741,18 +803,18 @@ def check_move_by_member_who_loses_access_returns_no_actions():
 
 
 def check_list_rows_carry_allowed_actions_and_counts_match():
-    from app.listing import status_counts
+    from app.listing import list_items, status_counts
 
     t = team()
     m = user("member", t["id"])
     mine = item(m, t["id"], status="in_progress", assignee_id=m["id"])
-    item(m, t["id"], status="open")
-    item(m, t["id"], status="done")
-    rows = {r["id"]: r for r in call(__import__("app.listing", fromlist=["x"]).list_items, m["id"],
-                                      team_id=str(t["id"]))["items"]}
-    assert "complete" in rows[mine["id"]]["allowed_actions"]
+    item(m, t["id"])
+    item(m, t["id"], status="completed")
+    rows = {r["id"]: r for r in call(list_items, m["id"], team_id=str(t["id"]))["items"]}
+    assert "move" in rows[mine["id"]]["allowed_actions"] and rows[mine["id"]]["status"]["name"] == "In progress"
     counts = call(status_counts, m["id"], team_id=str(t["id"]))
-    assert (counts["in_progress"], counts["open"], counts["done"], counts["blocked"]) == (1, 1, 1, 0), counts
+    assert counts == {str(status_id(t["id"], k)): 1 for k in ("todo", "in_progress", "completed")}, counts
+    expect_error(lambda: call(status_counts, m["id"], team_id=None), 400, "TEAM_REQUIRED")
 
 
 def check_change_notifies_only_on_commit():
@@ -788,6 +850,132 @@ def check_event_routing_respects_visibility():
     assert sub.wants({"team_ids": ["team-z", "team-a"], "created_by": "x"})  # moved out of my team
 
 
+# ---- Statuses -------------------------------------------------------------
+
+def check_every_team_gets_the_three_default_statuses():
+    t = team()
+    rows = sql("SELECT name, kind, finished FROM statuses WHERE team_id = %s ORDER BY position", (t["id"],))
+    assert [(r["name"], r["kind"], r["finished"]) for r in rows] == [
+        ("To do", "todo", False), ("In progress", "in_progress", False), ("Completed", "completed", True)]
+
+
+def check_leads_add_custom_statuses_members_can_only_read():
+    from app import statuses as st
+
+    t = team()
+    lead, m = user("lead", t["id"]), user("member", t["id"])
+    s_ = call(st.create_status, lead["id"], t["id"], st.StatusCreate(name="In review", color="teal"))
+    assert s_["kind"] == "custom" and s_["position"] == 4 and not s_["finished"]
+    expect_error(lambda: call(st.create_status, m["id"], t["id"], st.StatusCreate(name="Nope")), 403, "FORBIDDEN")
+    expect_error(lambda: call(st.create_status, user()["id"], t["id"], st.StatusCreate(name="Nope")), 404, "NOT_FOUND")
+    expect_error(lambda: call(st.create_status, lead["id"], t["id"], st.StatusCreate(name="in REVIEW")),
+                 409, "STATUS_EXISTS")
+    names = [x["name"] for x in call(st.list_team, m["id"], t["id"])]
+    assert names == ["To do", "In progress", "Completed", "In review"], names
+
+
+def check_default_statuses_cannot_be_renamed_or_deleted():
+    from app import statuses as st
+
+    t = team()
+    lead = user("lead", t["id"])
+    todo = status_id(t["id"], "todo")
+    expect_error(lambda: call(st.update_status, lead["id"], t["id"], todo, st.StatusPatch(name="Backlog")),
+                 403, "DEFAULT_STATUS")
+    expect_error(lambda: call(st.update_status, lead["id"], t["id"], todo, st.StatusPatch(finished=True)),
+                 403, "DEFAULT_STATUS")
+    expect_error(lambda: call(st.delete_status, lead["id"], t["id"], todo, None), 403, "DEFAULT_STATUS")
+    assert call(st.update_status, lead["id"], t["id"], todo, st.StatusPatch(color="red"))["color"] == "red"
+
+
+def check_custom_statuses_rename_and_reorder():
+    from app import statuses as st
+
+    t = team()
+    lead = user("lead", t["id"])
+    a = call(st.create_status, lead["id"], t["id"], st.StatusCreate(name="Alpha"))
+    b = call(st.create_status, lead["id"], t["id"], st.StatusCreate(name="Beta", finished=True))
+    assert call(st.update_status, lead["id"], t["id"], a["id"], st.StatusPatch(name="Review"))["name"] == "Review"
+    expect_error(lambda: call(st.update_status, lead["id"], t["id"], a["id"], st.StatusPatch(name="beta")),
+                 409, "STATUS_EXISTS")
+    order = [status_id(t["id"], "completed"), b["id"], a["id"], status_id(t["id"], "todo"), status_id(t["id"], "in_progress")]
+    got = call(st.reorder, lead["id"], t["id"], order)
+    assert [x["id"] for x in got] == order
+    expect_error(lambda: call(st.reorder, lead["id"], t["id"], order[:-1]), 422, "INVALID_ORDER")
+
+
+def check_deleting_a_status_moves_its_tasks_and_records_it():
+    from app import statuses as st
+
+    t = team()
+    lead, m = user("lead", t["id"]), user("member", t["id"])
+    review = call(st.create_status, lead["id"], t["id"], st.StatusCreate(name="Review"))
+    one, two = item(m, t["id"], status_id=review["id"]), item(m, t["id"], status_id=review["id"])
+    err = expect_error(lambda: call(st.delete_status, lead["id"], t["id"], review["id"], None), 409, "STATUS_IN_USE")
+    assert err.details["task_count"] == 2
+    expect_error(lambda: call(st.delete_status, lead["id"], t["id"], review["id"], review["id"]), 422, "INVALID_STATUS")
+    call(st.delete_status, lead["id"], t["id"], review["id"], status_id(t["id"], "in_progress"))
+    for it in (one, two):
+        row = sql("""SELECT s.name, w.version FROM work_items w JOIN statuses s ON s.id = w.status_id
+                     WHERE w.id = %s""", (it["id"],))[0]
+        assert (row["name"], row["version"]) == ("In progress", 2), row
+        assert activity_kinds(it["id"]) == ["status_changed"]
+    assert sql("SELECT 1 FROM statuses WHERE id = %s", (review["id"],)) == []
+    empty = call(st.create_status, lead["id"], t["id"], st.StatusCreate(name="Empty"))
+    call(st.delete_status, lead["id"], t["id"], empty["id"], None)  # nothing to move
+
+
+def check_team_move_maps_status_by_default_kind_then_name():
+    from app.items import update_item
+
+    a, b = team(), team()
+    lead = user("lead", a["id"])
+    review_a, only_a = custom_status(a["id"], "Review"), custom_status(a["id"], "Only here")
+    custom_status(b["id"], "review")
+    in_review = item(lead, a["id"], status_id=review_a["id"])
+    lonely = item(lead, a["id"], status_id=only_a["id"])
+    working = item(lead, a["id"], status="in_progress")
+    got = {k: call(update_item, i["id"], lead["id"], 1, {"team_id": b["id"]})["status"]["name"]
+           for k, i in (("review", in_review), ("lonely", lonely), ("working", working))}
+    assert got == {"review": "review", "lonely": "To do", "working": "In progress"}, got
+    changes = sql("SELECT payload FROM activity WHERE work_item_id = %s AND kind = 'updated'", (lonely["id"],))[0]
+    assert changes["payload"]["changes"]["status"] == {"from": "Only here", "to": "To do"}, changes
+
+
+# ---- Profile --------------------------------------------------------------
+
+def check_profile_lists_account_teams_members_and_work_summary():
+    from app.profile import get_profile
+
+    t = team()
+    lead, m = user("lead", t["id"], name="Pat Lead"), user("member", t["id"], name="Sam Member")
+    item(lead, t["id"], status="in_progress", assignee_id=m["id"])
+    late = item(lead, t["id"], assignee_id=m["id"])
+    sql("UPDATE work_items SET due_at = now() - interval '2 days' WHERE id = %s", (late["id"],))
+    item(m, t["id"], status="completed", assignee_id=m["id"])
+    p = call(get_profile, m["id"])
+    assert p["user"]["email"] == m["email"]
+    mine = p["teams"][0]
+    assert (mine["role"], mine["member_count"], mine["total_tasks"], mine["open_tasks"]) == ("member", 2, 3, 2), mine
+    assert [(x["name"], x["role"]) for x in mine["members"]] == [("Pat Lead", "lead"), ("Sam Member", "member")]
+    assert dict(p["stats"]) == {"assigned": 2, "overdue": 1, "finished": 1, "created": 1}, p["stats"]
+
+
+def check_profile_name_and_password_changes():
+    from app.auth import verify_password
+    from app.profile import PasswordChange, ProfilePatch, change_password, update_profile
+
+    m = user()
+    assert call(update_profile, m["id"], ProfilePatch(name="  New Name "))["user"]["name"] == "New Name"
+    expect_error(lambda: call(change_password, m["id"], PasswordChange(current_password="wrong", new_password="longenough1")),
+                 422, "WRONG_PASSWORD")
+    expect_error(lambda: call(change_password, m["id"], PasswordChange(current_password="password", new_password="password")),
+                 422, "SAME_PASSWORD")
+    call(change_password, m["id"], PasswordChange(current_password="password", new_password="brand-new-pass"))
+    stored = sql("SELECT password_hash FROM users WHERE id = %s", (m["id"],))[0]["password_hash"]
+    assert verify_password("brand-new-pass", stored) and not verify_password("password", stored)
+
+
 # ---- Sign-up --------------------------------------------------------------
 
 def signup_data(**kw):
@@ -818,6 +1006,7 @@ def check_signup_new_team_makes_lead_and_logs_in():
     me = __import__("json").loads(raw)
     assert status == 200 and me["user"]["email"] == f"{RUN}-{n}@check.test"  # stored lower-case
     assert [(t["name"], t["role"]) for t in me["teams"]] == [(f"check-{RUN}-{n}", "lead")]
+    assert [x["name"] for x in me["teams"][0]["statuses"]] == ["To do", "In progress", "Completed"]  # defaults
     # and the new account can log in with its password
     status, _, _ = asgi(app, "POST", "/api/login", {"email": body["email"], "password": "longenough"})
     assert status == 200
