@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>New task · Newtonite Ops</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600..800&family=Figtree:wght@400;500;600;700&display=swap">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body data-page="new">
+  <header id="topbar"></header>
+  <main class="narrow">
+    <h1>New task</h1>
+    <form id="new-form" class="card stack">
+      <label>Team
+        <select name="team_id" required></select>
+        <span class="hint" id="team-hint"></span>
+      </label>
+      <label>Title <input name="title" maxlength="200" required placeholder="What needs to happen?"></label>
+      <label>Description
+        <textarea name="description" rows="6" maxlength="20000" placeholder="Why does this exist? What is known so far?"></textarea>
+      </label>
+      <div class="row">
+        <label>Type <select name="type" required></select></label>
+        <label>Priority <select name="priority" required></select></label>
+        <label>Due <input name="due_at" type="datetime-local"></label>
+      </div>
+      <label id="assignee-field">Assign to
+        <select name="assignee_id"><option value="">Nobody yet</option></select>
+        <span class="hint" id="assignee-hint"></span>
+      </label>
+      <label class="check"><input name="requires_approval" type="checkbox"> Needs a lead's approval before work starts</label>
+      <label class="check" id="restrict-field"><input name="restricted" type="checkbox"> Restrict editing: other members can't change the details (team leads and you still can)</label>
+      <p id="new-error" class="error" hidden></p>
+      <button type="submit" class="primary">Create task</button>
+    </form>
+  </main>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

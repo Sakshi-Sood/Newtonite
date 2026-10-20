@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Create account · Newtonite Ops</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600..800&family=Figtree:wght@400;500;600;700&display=swap">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body data-page="signup">
+  <main class="narrow">
+    <h1>Create your account</h1>
+    <p class="muted">Already have one? <a href="/login.html">Sign in</a></p>
+    <form id="signup-form" class="card stack">
+      <label>Full name <input name="name" autocomplete="name" maxlength="100" required autofocus></label>
+      <label>Work email <input name="email" type="email" autocomplete="email" maxlength="254" required></label>
+      <label>Password <input name="password" type="password" autocomplete="new-password" minlength="8" maxlength="200" required>
+        <span class="muted">At least 8 characters.</span>
+      </label>
+
+      <fieldset class="stack">
+        <legend>Your team</legend>
+        <label class="check" id="join-option"><input type="radio" name="team_mode" value="join" checked> Join an existing team (as a member)</label>
+        <select name="team_id" aria-label="Team to join"></select>
+        <label class="check"><input type="radio" name="team_mode" value="create"> Create a new team (you become its lead)</label>
+        <input name="new_team_name" maxlength="100" placeholder="New team name, e.g. Payments" aria-label="New team name">
+      </fieldset>
+
+      <p id="signup-error" class="error" hidden></p>
+      <button type="submit" class="primary">Create account</button>
+    </form>
+  </main>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

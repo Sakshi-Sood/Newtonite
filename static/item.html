@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Work item · Newtonite Ops</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600..800&family=Figtree:wght@400;500;600;700&display=swap">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body data-page="item">
+  <header id="topbar"></header>
+  <main>
+    <div id="live-banner" class="banner" hidden></div>
+    <div id="flash" class="flash" hidden></div>
+    <div id="banner" class="banner" hidden></div>
+    <p id="load-error" class="error" hidden></p>
+
+    <div class="item-layout" id="item-root" hidden>
+      <div>
+        <section id="header"></section>
+        <section id="editor" hidden></section>
+        <section id="description" class="description"></section>
+        <section id="timeline" class="timeline">
+          <h2>Activity</h2>
+          <form id="comment-form" class="stack">
+            <textarea name="body" rows="3" maxlength="10000" placeholder="Add a comment…" required></textarea>
+            <div><button type="submit">Comment</button></div>
+          </form>
+          <ol id="entries"></ol>
+          <button type="button" id="older" hidden>Load older activity</button>
+        </section>
+      </div>
+      <aside id="meta" class="card"></aside>
+    </div>
+  </main>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in · Newtonite Ops</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600..800&family=Figtree:wght@400;500;600;700&display=swap">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body data-page="login">
+  <main class="narrow">
+    <h1>Newtonite Ops</h1>
+    <p class="muted">Sign in to see and coordinate your team's work.</p>
+    <form id="login-form" class="card stack">
+      <label>Email <input name="email" type="email" autocomplete="username" required autofocus></label>
+      <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
+      <p id="login-error" class="error" hidden></p>
+      <button type="submit" class="primary">Sign in</button>
+    </form>
+    <p class="muted">New here? <a href="/signup.html">Create an account</a></p>
+  </main>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
