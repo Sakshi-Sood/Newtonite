@@ -46,13 +46,18 @@ def team() -> dict:
     return sql("INSERT INTO teams (name) VALUES (%s) RETURNING *", (f"check-{RUN}-{_next()}",))[0]
 
 
+_PASSWORD_HASH = None
+
+
 def user(role: str | None = None, team_id=None, name: str | None = None) -> dict:
     from app.auth import hash_password
 
+    global _PASSWORD_HASH
+    _PASSWORD_HASH = _PASSWORD_HASH or hash_password("password")  # scrypt is slow; hash once per run
     n = _next()
     row = sql(
         "INSERT INTO users (email, name, password_hash) VALUES (%s, %s, %s) RETURNING *",
-        (f"{RUN}-{n}@check.test", name or f"Check User {n}", hash_password("password")),
+        (f"{RUN}-{n}@check.test", name or f"Check User {n}", _PASSWORD_HASH),
     )[0]
     if role:
         add_member(row["id"], team_id, role)
@@ -562,6 +567,60 @@ def check_overview_counts_match_lists():
 def check_unknown_view_400():
     m = user()
     expect_error(lambda: ids(m, view="everything"), 400, "INVALID_VIEW")
+
+
+# ---- Final review fixes ---------------------------------------------------
+
+def asgi(app, method: str, path: str, body=None, headers=None, on_start=None) -> tuple[int, dict, bytes]:
+    """Call the real FastAPI app in-process (no HTTP server, no extra deps).
+    `on_start` runs at the moment the response starts being sent."""
+    import asyncio
+    import json as _json
+
+    raw = _json.dumps(body).encode() if body is not None else b""
+    hdrs = [(b"content-type", b"application/json")] + [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()]
+    scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": method,
+             "path": path, "raw_path": path.encode(), "query_string": b"", "headers": hdrs,
+             "scheme": "http", "server": ("test", 80), "client": ("127.0.0.1", 1), "root_path": ""}
+    out = {"status": 0, "headers": {}, "body": b""}
+    sent = False
+
+    async def receive():
+        nonlocal sent
+        if not sent:
+            sent = True
+            return {"type": "http.request", "body": raw, "more_body": False}
+        await asyncio.sleep(3600)
+
+    async def send(msg):
+        if msg["type"] == "http.response.start":
+            out["status"] = msg["status"]
+            out["headers"] = {k.decode(): v.decode() for k, v in msg["headers"]}
+            if on_start:
+                on_start()
+        elif msg["type"] == "http.response.body":
+            out["body"] += msg.get("body", b"")
+
+    asyncio.run(app(scope, receive, send))
+    return out["status"], out["headers"], out["body"]
+
+
+def check_change_is_committed_before_response_is_sent():
+    from app.main import create_app
+
+    app = create_app()
+    app.state.pool = pool  # skip lifespan; reuse the check pool
+    t = team()
+    m = user("member", t["id"])
+    _, h, _ = asgi(app, "POST", "/api/login", {"email": m["email"], "password": "password"})
+    cookie = h["set-cookie"].split(";")[0]
+    seen = {}
+    status, _, _ = asgi(app, "POST", "/api/items",
+                        {"team_id": str(t["id"]), "title": "Commit timing", "type": "task", "priority": "low"},
+                        {"cookie": cookie, "idempotency-key": "commit-1"},
+                        on_start=lambda: seen.setdefault("count", item_count(t["id"])))
+    assert status == 201, status
+    assert seen["count"] == 1, "the client was told 201 before the item was committed"
 
 
 # ---- runner ---------------------------------------------------------------
