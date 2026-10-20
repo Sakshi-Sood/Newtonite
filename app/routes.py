@@ -44,6 +44,22 @@ def list_items(
     )
 
 
+# Declared before /{item_id} so "counts" isn't taken for an item id.
+@router.get("/counts")
+def status_counts(
+    user: User,
+    conn: Conn,
+    view: str | None = None,
+    team_id: str | None = None,
+    priority: str | None = None,
+    type: str | None = None,
+    assignee: str | None = None,
+    q: str | None = None,
+):
+    return listing.status_counts(conn, user["id"], view=view, team_id=team_id, priority=_csv(priority),
+                                 type=_csv(type), assignee=assignee, q=q)
+
+
 def _idempotent(request: Request, conn: Connection, user: dict, body, fn: Callable[[], tuple[int, dict]]):
     """Run a POST through the Idempotency-Key check; replays get a marker header."""
     h = request_hash(request.method, request.url.path, body)

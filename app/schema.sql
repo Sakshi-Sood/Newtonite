@@ -38,7 +38,9 @@ CREATE TABLE work_items (
     priority          item_priority NOT NULL,
     status            item_status NOT NULL,
     assignee_id       uuid REFERENCES users (id) ON DELETE SET NULL,
+    assigned_by       uuid REFERENCES users (id) ON DELETE SET NULL,  -- who made the current assignment
     requires_approval boolean NOT NULL,
+    restricted        boolean NOT NULL DEFAULT false,  -- details editable by leads + creator only
     due_at            timestamptz,
     created_by        uuid NOT NULL REFERENCES users (id) ON DELETE CASCADE,
     created_at        timestamptz NOT NULL DEFAULT now(),
@@ -54,6 +56,7 @@ CREATE INDEX work_items_search_idx ON work_items USING gin (search);
 CREATE INDEX work_items_team_status_idx
     ON work_items (team_id, status, priority, last_activity_at DESC);
 CREATE INDEX work_items_assignee_idx ON work_items (assignee_id, status);
+CREATE INDEX work_items_created_by_idx ON work_items (created_by);
 
 -- Append-only history of everything that happened to an item (comments included).
 CREATE TABLE activity (

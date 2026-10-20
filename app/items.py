@@ -1,6 +1,7 @@
 """Work item operations. Every function takes the request's connection, so the
 change and its activity row commit (or roll back) together.
 """
+import json
 import uuid
 from datetime import datetime, timezone
 from typing import Annotated, Literal
@@ -19,7 +20,8 @@ ItemType = Literal[ITEM_TYPES]
 Priority = Literal[PRIORITIES]
 # Times without a zone are taken as UTC, so they compare cleanly with stored timestamptz values.
 AwareDatetime = Annotated[datetime, AfterValidator(lambda d: d if d.tzinfo else d.replace(tzinfo=timezone.utc))]
-EDITABLE = ("title", "description", "priority", "due_at")
+EDITABLE = ("title", "description", "priority", "due_at")  # plain detail fields
+CHANNEL = "item_changes"  # Postgres NOTIFY channel; app.events turns it into live updates
 
 
 class ItemCreate(BaseModel):
@@ -29,7 +31,9 @@ class ItemCreate(BaseModel):
     type: ItemType
     priority: Priority
     requires_approval: bool = False
+    restricted: bool = False
     due_at: AwareDatetime | None = None
+    assignee_id: uuid.UUID | None = None
 
 
 class ItemPatch(BaseModel):
@@ -38,19 +42,23 @@ class ItemPatch(BaseModel):
     description: Description | None = None
     priority: Priority | None = None
     due_at: AwareDatetime | None = None  # explicit null clears the due date
+    restricted: bool | None = None
+    team_id: uuid.UUID | None = None      # move to another team
+    assignee_id: uuid.UUID | None = None  # explicit null unassigns
 
     @model_validator(mode="after")
     def _check(self):
         sent = self.model_fields_set - {"expected_version"}
         if not sent:
             raise ValueError("Send at least one field to change.")
-        for field in ("title", "description", "priority"):
+        for field in ("title", "description", "priority", "restricted", "team_id"):
             if field in sent and getattr(self, field) is None:
                 raise ValueError(f"{field} cannot be null.")
         return self
 
     def changes(self) -> dict:
-        return {f: getattr(self, f) for f in EDITABLE if f in self.model_fields_set}
+        fields = EDITABLE + ("restricted", "team_id", "assignee_id")
+        return {f: getattr(self, f) for f in fields if f in self.model_fields_set}
 
 
 class CommentIn(BaseModel):
@@ -79,11 +87,20 @@ def role_in_team(conn: Connection, user_id, team_id) -> str | None:
     return row["role"] if row else None
 
 
-def load_item(conn: Connection, item_id: str, user_id, for_update: bool = False) -> tuple[dict, str]:
-    """The item row and the caller's role in its team.
+def access_role(conn: Connection, user_id, item: dict) -> str | None:
+    """The caller's role for this item: their team role, or "requester" if they
+    created it from outside the team, or None (no access)."""
+    role = role_in_team(conn, user_id, item["team_id"])
+    if role is None and str(item["created_by"]) == str(user_id):
+        return "requester"
+    return role
 
-    Missing items, malformed ids and items in teams the caller isn't in all
-    look the same (404), so outsiders can't learn what exists.
+
+def load_item(conn: Connection, item_id: str, user_id, for_update: bool = False) -> tuple[dict, str]:
+    """The item row and the caller's role for it.
+
+    Missing items, malformed ids and items the caller can't see all look the
+    same (404), so outsiders can't learn what exists.
     """
     try:
         item_uuid = uuid.UUID(str(item_id))
@@ -93,7 +110,7 @@ def load_item(conn: Connection, item_id: str, user_id, for_update: bool = False)
     row = conn.execute(f"SELECT * FROM work_items WHERE id = %s{lock}", (item_uuid,)).fetchone()
     if row is None:
         raise _not_found()
-    role = role_in_team(conn, user_id, row["team_id"])
+    role = access_role(conn, user_id, row)
     if role is None:
         raise _not_found()
     return row, role
@@ -105,13 +122,23 @@ def require(item: dict, user_id, role: str, permission: str) -> None:
                        {"permission": permission})
 
 
-def record_activity(conn: Connection, item_id, actor_id, kind: str, payload: dict) -> int:
+def record_activity(conn: Connection, item_id, actor_id, kind: str, payload: dict, also_team=None) -> int:
     row = conn.execute(
         """INSERT INTO activity (work_item_id, actor_id, kind, payload)
            VALUES (%s, %s, %s, %s) RETURNING id""",
         (item_id, actor_id, kind, Jsonb(jsonable_encoder(payload))),
     ).fetchone()
-    conn.execute("UPDATE work_items SET last_activity_at = now() WHERE id = %s", (item_id,))
+    item = conn.execute(
+        "UPDATE work_items SET last_activity_at = now() WHERE id = %s RETURNING team_id, created_by",
+        (item_id,),
+    ).fetchone()
+    # Postgres delivers NOTIFY only when this transaction commits, so a change
+    # that rolls back never announces itself. `also_team` = the old team on a move.
+    teams = [str(item["team_id"])] + ([str(also_team)] if also_team else [])
+    conn.execute("SELECT pg_notify(%s, %s)", (CHANNEL, json.dumps({
+        "item_id": str(item_id), "team_ids": teams, "created_by": str(item["created_by"]),
+        "actor_id": str(actor_id), "kind": kind,
+    })))
     return row["id"]
 
 
@@ -131,13 +158,16 @@ def item_dto(conn: Connection, row: dict, user_id, role: str) -> dict:
         "priority": row["priority"],
         "status": row["status"],
         "requires_approval": row["requires_approval"],
+        "restricted": row["restricted"],
         "due_at": row["due_at"],
         "assignee": {"id": row["assignee_id"], "name": names["assignee_name"]} if row["assignee_id"] else None,
+        "assigned_by": _user_ref(conn, row["assigned_by"]),
         "created_by": {"id": row["created_by"], "name": names["creator_name"]},
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
         "last_activity_at": row["last_activity_at"],
         "version": row["version"],
+        "my_role": role,
         "allowed_actions": allowed_actions(row, user_id, role),
     }
 
@@ -147,20 +177,43 @@ def _fresh_dto(conn: Connection, item_id, user_id, role: str) -> dict:
     return item_dto(conn, row, user_id, role)
 
 
+def _team_exists(conn: Connection, team_id) -> bool:
+    return conn.execute("SELECT 1 FROM teams WHERE id = %s", (team_id,)).fetchone() is not None
+
+
+def _check_assignee(conn: Connection, team_id, assignee_id) -> None:
+    if assignee_id is not None and role_in_team(conn, assignee_id, team_id) is None:
+        raise AppError(422, "INVALID_ASSIGNEE", "The assignee must be a member of the item's team.")
+
+
 def create_item(conn: Connection, user_id, data: ItemCreate) -> dict:
-    role = role_in_team(conn, user_id, data.team_id)
-    if role is None:
-        raise AppError(404, "NOT_FOUND", "Team not found.")
+    """Create an item in any team. Outside your own teams it's a request: you
+    can follow, comment and edit it, and that team does the work."""
+    if not _team_exists(conn, data.team_id):
+        raise AppError(422, "INVALID_TEAM", "That team doesn't exist.")
+    role = role_in_team(conn, user_id, data.team_id) or "requester"
+    if data.assignee_id is not None:
+        _check_assignee(conn, data.team_id, data.assignee_id)
+        # Anyone in the team may assign anyone in it; a requester leaves that to the team.
+        if role == "requester":
+            raise AppError(403, "FORBIDDEN", "The team you're sending this to decides who works on it.",
+                           {"permission": "assign"})
+    if data.restricted and role == "lead":
+        raise AppError(403, "FORBIDDEN", "Leads can always edit, so restricting is only for other creators.",
+                       {"permission": "restrict"})
     status = "awaiting_approval" if data.requires_approval else "open"
     row = conn.execute(
-        """INSERT INTO work_items
-               (team_id, title, description, type, priority, status, requires_approval, due_at, created_by)
-           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING *""",
+        """INSERT INTO work_items (team_id, title, description, type, priority, status,
+                                   requires_approval, restricted, due_at, assignee_id, assigned_by, created_by)
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING *""",
         (data.team_id, data.title, data.description, data.type, data.priority, status,
-         data.requires_approval, data.due_at, user_id),
+         data.requires_approval, data.restricted, data.due_at, data.assignee_id,
+         user_id if data.assignee_id else None, user_id),
     ).fetchone()
     record_activity(conn, row["id"], user_id, "created",
                     {"title": row["title"], "priority": row["priority"], "status": status})
+    if data.assignee_id is not None:
+        record_activity(conn, row["id"], user_id, "assigned", _assignment_payload(conn, None, data.assignee_id))
     return _fresh_dto(conn, row["id"], user_id, role)
 
 
@@ -183,22 +236,60 @@ def stale_error(conn: Connection, item_id, user_id, role: str) -> AppError:
                      "changed_by": {"id": last["id"], "name": last["name"]} if last else None})
 
 
+def _team_name(conn: Connection, team_id) -> str:
+    return conn.execute("SELECT name FROM teams WHERE id = %s", (team_id,)).fetchone()["name"]
+
+
+UPDATABLE = EDITABLE + ("restricted", "team_id", "assignee_id")
+
+
 def update_item(conn: Connection, item_id: str, user_id, expected_version: int, changes: dict) -> dict:
+    """Edit details, the restriction flag, the team (move) and/or the assignee in one
+    versioned update. Only fields that actually change are checked and written."""
     row, role = load_item(conn, item_id, user_id)
-    require(row, user_id, role, "edit")
-    diffs = {f: {"from": row[f], "to": v} for f, v in changes.items() if f in EDITABLE and row[f] != v}
-    if not diffs:
+    changed = {f: v for f, v in changes.items() if f in UPDATABLE and row[f] != v}
+    if not changed:
         return item_dto(conn, row, user_id, role)
-    sets = ", ".join(f"{f} = %s" for f in diffs)  # field names come from EDITABLE only
+    if set(changed) - {"assignee_id"}:
+        require(row, user_id, role, "edit")
+    if "restricted" in changed:
+        require(row, user_id, role, "restrict")
+
+    team_id = changed.get("team_id", row["team_id"])
+    if "team_id" in changed and not _team_exists(conn, team_id):
+        raise AppError(422, "INVALID_TEAM", "That team doesn't exist.")
+    if "assignee_id" in changed:
+        taking_it = str(changed["assignee_id"]) == str(user_id) and can(row, user_id, role, "claim")
+        if not taking_it:
+            require(row, user_id, role, "assign")
+        _check_assignee(conn, team_id, changed["assignee_id"])
+    elif "team_id" in changed and row["assignee_id"] and role_in_team(conn, row["assignee_id"], team_id) is None:
+        changed["assignee_id"] = None  # moved away from the assignee's team
+    if "assignee_id" in changed:
+        changed["assigned_by"] = user_id if changed["assignee_id"] else None
+
+    sets = ", ".join(f"{f} = %s" for f in changed)  # names come from UPDATABLE (+ assigned_by) only
     updated = conn.execute(
         f"""UPDATE work_items SET {sets}, version = version + 1, updated_at = now()
             WHERE id = %s AND version = %s RETURNING *""",
-        (*[d["to"] for d in diffs.values()], row["id"], expected_version),
+        (*changed.values(), row["id"], expected_version),
     ).fetchone()
     if updated is None:
         raise stale_error(conn, row["id"], user_id, role)
-    record_activity(conn, row["id"], user_id, "updated", {"changes": diffs})
-    return _fresh_dto(conn, row["id"], user_id, role)
+
+    details = {f: {"from": row[f], "to": v} for f, v in changed.items()
+               if f not in ("team_id", "assignee_id", "assigned_by")}
+    if "team_id" in changed:
+        details["team"] = {"from": _team_name(conn, row["team_id"]), "to": _team_name(conn, team_id)}
+    if details:
+        record_activity(conn, row["id"], user_id, "updated", {"changes": details},
+                        also_team=row["team_id"] if "team_id" in changed else None)
+    if "assignee_id" in changed:
+        record_activity(conn, row["id"], user_id, "assigned",
+                        _assignment_payload(conn, row["assignee_id"], changed["assignee_id"]))
+    # After a move the caller may no longer have access; they then get allowed_actions = [].
+    fresh = conn.execute("SELECT * FROM work_items WHERE id = %s", (row["id"],)).fetchone()
+    return item_dto(conn, fresh, user_id, access_role(conn, user_id, fresh))
 
 
 def _user_ref(conn: Connection, user_id) -> dict | None:
@@ -232,10 +323,10 @@ def claim_item(conn: Connection, item_id: str, user_id) -> dict:
         raise _already_claimed(conn, row["id"])
     require(row, user_id, role, "claim")
     updated = conn.execute(
-        """UPDATE work_items SET assignee_id = %s, version = version + 1, updated_at = now()
+        """UPDATE work_items SET assignee_id = %s, assigned_by = %s, version = version + 1, updated_at = now()
            WHERE id = %s AND assignee_id IS NULL AND status NOT IN ('done', 'cancelled')
            RETURNING *""",
-        (user_id, row["id"]),
+        (user_id, user_id, row["id"]),
     ).fetchone()
     if updated is None:
         raise _already_claimed(conn, row["id"])
@@ -251,9 +342,9 @@ def assign_item(conn: Connection, item_id: str, user_id, assignee_id, expected_v
     if str(row["assignee_id"]) == str(assignee_id):
         return item_dto(conn, row, user_id, role)
     updated = conn.execute(
-        """UPDATE work_items SET assignee_id = %s, version = version + 1, updated_at = now()
+        """UPDATE work_items SET assignee_id = %s, assigned_by = %s, version = version + 1, updated_at = now()
            WHERE id = %s AND version = %s RETURNING *""",
-        (assignee_id, row["id"], expected_version),
+        (assignee_id, user_id if assignee_id else None, row["id"], expected_version),
     ).fetchone()
     if updated is None:
         raise stale_error(conn, row["id"], user_id, role)

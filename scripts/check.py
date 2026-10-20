@@ -152,13 +152,12 @@ def check_requires_approval_starts_awaiting():
     assert create(m, t["id"], requires_approval=True)["status"] == "awaiting_approval"
 
 
-def check_outsider_create_and_get_404():
+def check_outsider_cannot_see_other_peoples_items():
     from app.items import get_item
 
     t = team()
     m = user("member", t["id"])
     outsider = user()
-    expect_error(lambda: create(outsider, t["id"]), 404, "NOT_FOUND")
     it = create(m, t["id"])
     expect_error(lambda: call(get_item, it["id"], outsider["id"]), 404, "NOT_FOUND")
 
@@ -167,8 +166,8 @@ def check_membership_removed_404():
     from app.items import get_item
 
     t = team()
-    m = user("member", t["id"])
-    it = create(m, t["id"])
+    creator, m = user("member", t["id"]), user("member", t["id"])
+    it = create(creator, t["id"])
     call(get_item, it["id"], m["id"])  # works while a member
     sql("DELETE FROM memberships WHERE user_id = %s", (m["id"],))
     expect_error(lambda: call(get_item, it["id"], m["id"]), 404, "NOT_FOUND")
@@ -634,6 +633,159 @@ def check_stale_names_the_editor_not_a_later_commenter():
     call(add_comment, it["id"], commenter["id"], "just a comment")  # doesn't change the item
     err = expect_error(lambda: call(update_item, it["id"], commenter["id"], 1, {"title": "stale"}), 409, "STALE_VERSION")
     assert err.details["changed_by"] == {"id": editor["id"], "name": "The Editor"}, err.details["changed_by"]
+
+
+# ---- Cross-team requests, restriction, assignment, moving -----------------
+
+def check_cross_team_request_requester_can_follow_and_edit():
+    from app.items import claim_item, get_item, update_item
+
+    owners = team()
+    lead = user("lead", owners["id"])
+    requester = user()  # in no team
+    it = create(requester, owners["id"], title="Please refund order 77")
+    assert it["my_role"] == "requester" and "claim" not in it["allowed_actions"], it["allowed_actions"]
+    assert call(get_item, it["id"], lead["id"])["my_role"] == "lead"  # owning team sees it
+    edited = call(update_item, it["id"], requester["id"], 1, {"title": "Please refund order 78"})
+    assert edited["title"] == "Please refund order 78"
+    expect_error(lambda: call(claim_item, it["id"], requester["id"]), 403, "FORBIDDEN")
+    assert it["id"] in ids(requester, view="requested_by_me")
+    assert it["id"] not in ids(lead, view="requested_by_me")
+
+
+def check_restricted_item_details_locked_for_members_not_status():
+    from app.items import update_item
+
+    t = team()
+    creator, worker, lead = user("member", t["id"]), user("member", t["id"]), user("lead", t["id"])
+    it = create(creator, t["id"], restricted=True, assignee_id=creator["id"])
+    sql("UPDATE work_items SET assignee_id = %s WHERE id = %s", (worker["id"], it["id"]))
+    expect_error(lambda: call(update_item, it["id"], worker["id"], 1, {"title": "nope"}), 403, "FORBIDDEN")
+    v = call(update_item, it["id"], creator["id"], 1, {"title": "creator edit"})["version"]
+    v = call(update_item, it["id"], lead["id"], v, {"title": "lead edit"})["version"]
+    assert transition(it, worker, "start", v)["status"] == "in_progress"  # status not locked
+
+
+def check_only_leads_and_creator_change_restriction():
+    from app.items import update_item
+
+    t = team()
+    creator, other = user("member", t["id"]), user("member", t["id"])
+    it = create(creator, t["id"])
+    expect_error(lambda: call(update_item, it["id"], other["id"], 1, {"restricted": True}), 403, "FORBIDDEN")
+    assert call(update_item, it["id"], creator["id"], 1, {"restricted": True})["restricted"] is True
+
+
+def check_assign_at_create_rules():
+    t = team()
+    lead, m, other = user("lead", t["id"]), user("member", t["id"]), user("member", t["id"])
+    assert create(lead, t["id"], assignee_id=m["id"])["assignee"]["id"] == m["id"]
+    got = create(m, t["id"], assignee_id=other["id"])  # any member may assign anyone in the team
+    assert got["assignee"]["id"] == other["id"] and got["assigned_by"]["id"] == m["id"]
+    expect_error(lambda: create(lead, t["id"], assignee_id=user()["id"]), 422, "INVALID_ASSIGNEE")
+    expect_error(lambda: create(user(), t["id"], assignee_id=m["id"]), 403, "FORBIDDEN")  # requester
+
+
+def check_assigner_can_reassign_but_assignee_cannot_pass_it_on():
+    from app.items import assign_item, update_item
+
+    t = team()
+    assigner, worker, third = user("member", t["id"]), user("member", t["id"]), user("member", t["id"])
+    it = create(assigner, t["id"], assignee_id=worker["id"])
+    assert "assign" not in call(__import__("app.items", fromlist=["x"]).get_item, it["id"], worker["id"])["allowed_actions"]
+    expect_error(lambda: call(assign_item, it["id"], worker["id"], third["id"], it["version"]), 403, "FORBIDDEN")
+    expect_error(lambda: call(update_item, it["id"], worker["id"], it["version"], {"assignee_id": third["id"]}),
+                 403, "FORBIDDEN")
+    moved = call(assign_item, it["id"], assigner["id"], third["id"], it["version"])
+    assert moved["assignee"]["id"] == third["id"] and moved["assigned_by"]["id"] == assigner["id"]
+
+
+def check_leads_never_get_restrict():
+    from app.items import update_item
+
+    t = team()
+    lead, m = user("lead", t["id"]), user("member", t["id"])
+    expect_error(lambda: create(lead, t["id"], restricted=True), 403, "FORBIDDEN")
+    it = create(lead, t["id"])
+    assert "restrict" not in it["allowed_actions"]
+    expect_error(lambda: call(update_item, it["id"], lead["id"], 1, {"restricted": True}), 403, "FORBIDDEN")
+    assert "restrict" in create(m, t["id"])["allowed_actions"]  # a member creator does get it
+
+
+def check_move_team_clears_foreign_assignee_and_logs():
+    from app.items import update_item
+
+    a, b = team(), team()
+    lead = user("lead", a["id"])
+    worker = user("member", a["id"])
+    it = create(lead, a["id"], assignee_id=worker["id"])
+    moved = call(update_item, it["id"], lead["id"], 1, {"team_id": b["id"]})
+    assert moved["team"]["id"] == b["id"] and moved["assignee"] is None
+    # lead created it, so keeps access as requester in the new team
+    assert moved["my_role"] == "requester"
+    payloads = [r["payload"] for r in sql(
+        "SELECT payload FROM activity WHERE work_item_id = %s AND kind = 'updated'", (it["id"],))]
+    assert payloads[-1]["changes"]["team"] == {"from": a["name"], "to": b["name"]}, payloads
+    assert activity_kinds(it["id"])[-1] == "assigned"
+
+
+def check_move_by_member_who_loses_access_returns_no_actions():
+    from app.items import get_item, update_item
+
+    a, b = team(), team()
+    creator, mover = user("member", a["id"]), user("member", a["id"])
+    it = create(creator, a["id"])
+    moved = call(update_item, it["id"], mover["id"], 1, {"team_id": b["id"]})
+    assert moved["allowed_actions"] == []
+    expect_error(lambda: call(get_item, it["id"], mover["id"]), 404, "NOT_FOUND")
+
+
+def check_list_rows_carry_allowed_actions_and_counts_match():
+    from app.listing import status_counts
+
+    t = team()
+    m = user("member", t["id"])
+    mine = item(m, t["id"], status="in_progress", assignee_id=m["id"])
+    item(m, t["id"], status="open")
+    item(m, t["id"], status="done")
+    rows = {r["id"]: r for r in call(__import__("app.listing", fromlist=["x"]).list_items, m["id"],
+                                      team_id=str(t["id"]))["items"]}
+    assert "complete" in rows[mine["id"]]["allowed_actions"]
+    counts = call(status_counts, m["id"], team_id=str(t["id"]))
+    assert (counts["in_progress"], counts["open"], counts["done"], counts["blocked"]) == (1, 1, 1, 0), counts
+
+
+def check_change_notifies_only_on_commit():
+    import psycopg as _pg
+
+    from app.items import update_item
+
+    t = team()
+    m = user("member", t["id"])
+    it = create(m, t["id"])
+    with _pg.connect(DATABASE_URL, autocommit=True) as listener:
+        listener.execute("LISTEN item_changes")
+        list(listener.notifies(timeout=0.2))  # drain anything older
+        try:  # a change that rolls back must not be announced
+            with tx() as conn:
+                update_item(conn, it["id"], m["id"], 1, {"title": "rolled back"})
+                raise RuntimeError("abort")
+        except RuntimeError:
+            pass
+        assert [n for n in listener.notifies(timeout=0.5)] == []
+        call(update_item, it["id"], m["id"], 1, {"title": "committed"})
+        notes = [__import__("json").loads(n.payload) for n in listener.notifies(timeout=2, stop_after=1)]
+    assert notes and notes[0]["item_id"] == str(it["id"]) and notes[0]["team_ids"] == [str(t["id"])], notes
+
+
+def check_event_routing_respects_visibility():
+    from app.events import Subscriber
+
+    sub = Subscriber("u1", {"team-a"})
+    assert sub.wants({"team_ids": ["team-a"], "created_by": "x"})
+    assert sub.wants({"team_ids": ["team-z"], "created_by": "u1"})  # my request elsewhere
+    assert not sub.wants({"team_ids": ["team-z"], "created_by": "x"})
+    assert sub.wants({"team_ids": ["team-z", "team-a"], "created_by": "x"})  # moved out of my team
 
 
 # ---- Sign-up --------------------------------------------------------------
