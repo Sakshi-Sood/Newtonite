@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Overview · Newtonite Ops</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body data-page="overview">
+  <header id="topbar"></header>
+  <main>
+    <section aria-label="Needs attention">
+      <h2>Needs attention</h2>
+      <div id="tiles" class="tiles"></div>
+    </section>
+
+    <section aria-label="Work items">
+      <form id="filters" class="filters">
+        <input name="q" type="search" placeholder="Search titles and descriptions…" aria-label="Search">
+        <select name="team_id" aria-label="Team"><option value="">All my teams</option></select>
+        <select name="status" aria-label="Status"><option value="">Any status</option></select>
+        <select name="priority" aria-label="Priority"><option value="">Any priority</option></select>
+        <select name="assignee" aria-label="Assignee">
+          <option value="">Anyone</option>
+          <option value="me">Assigned to me</option>
+          <option value="unassigned">Unassigned</option>
+        </select>
+        <select name="sort" aria-label="Sort">
+          <option value="">Sort: priority</option>
+          <option value="updated">Sort: recently active</option>
+          <option value="created">Sort: newest</option>
+        </select>
+        <button type="button" id="clear-filters">Clear</button>
+      </form>
+      <p id="active-view" class="muted" hidden></p>
+      <p id="list-error" class="error" hidden></p>
+      <table class="items">
+        <thead>
+          <tr><th>Title</th><th>Team</th><th>Status</th><th>Priority</th><th>Assignee</th><th>Last activity</th></tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+      <p id="empty" class="muted" hidden>No work items match these filters.</p>
+      <nav class="pager">
+        <button type="button" id="prev">← Previous</button>
+        <span id="page-label" class="muted"></span>
+        <button type="button" id="next">Next →</button>
+      </nav>
+    </section>
+  </main>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
