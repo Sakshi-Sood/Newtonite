@@ -112,6 +112,97 @@ def check_password_hash_roundtrip():
     assert h != hash_password("s3cret"), "hashes must be salted"
 
 
+# ---- Task 4: create/read, access, timeline --------------------------------
+
+def create(u: dict, team_id, **kw) -> dict:
+    from app.items import ItemCreate, create_item
+
+    data = ItemCreate(**{"team_id": team_id, "title": "Checked item", "type": "task", "priority": "medium", **kw})
+    with tx() as conn:
+        return create_item(conn, u["id"], data)
+
+
+def call(fn, *args, **kw):
+    """Run an app.items function in its own transaction."""
+    with tx() as conn:
+        return fn(conn, *args, **kw)
+
+
+def activity_kinds(item_id) -> list[str]:
+    return [r["kind"] for r in sql("SELECT kind FROM activity WHERE work_item_id = %s ORDER BY id", (item_id,))]
+
+
+def check_create_open_item():
+    t = team()
+    m = user("member", t["id"])
+    it = create(m, t["id"])
+    assert it["status"] == "open" and it["version"] == 1, it
+    assert activity_kinds(it["id"]) == ["created"]
+
+
+def check_requires_approval_starts_awaiting():
+    t = team()
+    m = user("member", t["id"])
+    assert create(m, t["id"], requires_approval=True)["status"] == "awaiting_approval"
+
+
+def check_outsider_create_and_get_404():
+    from app.items import get_item
+
+    t = team()
+    m = user("member", t["id"])
+    outsider = user()
+    expect_error(lambda: create(outsider, t["id"]), 404, "NOT_FOUND")
+    it = create(m, t["id"])
+    expect_error(lambda: call(get_item, it["id"], outsider["id"]), 404, "NOT_FOUND")
+
+
+def check_membership_removed_404():
+    from app.items import get_item
+
+    t = team()
+    m = user("member", t["id"])
+    it = create(m, t["id"])
+    call(get_item, it["id"], m["id"])  # works while a member
+    sql("DELETE FROM memberships WHERE user_id = %s", (m["id"],))
+    expect_error(lambda: call(get_item, it["id"], m["id"]), 404, "NOT_FOUND")
+
+
+def check_malformed_id_404():
+    from app.items import get_item
+
+    m = user()
+    expect_error(lambda: call(get_item, "abc", m["id"]), 404, "NOT_FOUND")
+
+
+def check_activity_pages_of_50():
+    from app.items import list_activity
+
+    t = team()
+    m = user("member", t["id"])
+    it = create(m, t["id"])  # 1 'created' entry
+    sql("""INSERT INTO activity (work_item_id, actor_id, kind, payload)
+           SELECT %s, %s, 'comment', jsonb_build_object('body', 'c' || g) FROM generate_series(1, 119) g""",
+        (it["id"], m["id"]))
+    seen, sizes, before = [], [], None
+    while True:
+        page = call(list_activity, it["id"], m["id"], before)
+        sizes.append(len(page["entries"]))
+        seen += [e["id"] for e in page["entries"]]
+        before = page["next_before_id"]
+        if before is None:
+            break
+    assert sizes == [50, 50, 20], sizes
+    assert len(seen) == len(set(seen)) == 120
+
+
+def check_member_actions_on_unassigned_open():
+    t = team()
+    m = user("member", t["id"])
+    acts = create(m, t["id"])["allowed_actions"]
+    assert "claim" in acts and "start" not in acts and "assign" not in acts, acts
+
+
 # ---- runner ---------------------------------------------------------------
 
 def main() -> int:

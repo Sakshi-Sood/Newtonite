@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
 
-from app import auth
+from app import auth, routes
 from app.config import DATABASE_URL, SECRET_KEY
 from app.db import create_pool
 from app.errors import install_handlers
@@ -26,6 +26,7 @@ def create_app() -> FastAPI:
     app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, max_age=12 * 3600, same_site="lax")
     install_handlers(app)
     app.include_router(auth.router)
+    app.include_router(routes.router)
     # Static frontend last, so /api routes take precedence.
     app.mount("/", StaticFiles(directory=STATIC_DIR, html=True, check_dir=False), name="static")
     return app
