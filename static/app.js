@@ -156,6 +156,49 @@ async function initLogin() {
   });
 }
 
+// ------------------------------------------------------------- signup ----
+
+async function initSignup() {
+  const form = $("#signup-form");
+  const f = form.elements;
+  const teams = await api("GET", "/api/teams");
+  for (const t of teams) f.team_id.append(el("option", { value: t.id }, t.name));
+  if (teams.length === 0) {
+    // First person in: there is nothing to join yet.
+    $("#join-option").hidden = true;
+    f.team_id.hidden = true;
+    f.team_mode.value = "create";
+  }
+  const syncMode = () => {
+    const create = f.team_mode.value === "create";
+    f.team_id.disabled = create;
+    f.new_team_name.disabled = !create;
+    f.new_team_name.required = create;
+  };
+  form.addEventListener("change", syncMode);
+  syncMode();
+
+  form.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const create = f.team_mode.value === "create";
+    const body = {
+      name: f.name.value, email: f.email.value, password: f.password.value,
+      ...(create ? { new_team_name: f.new_team_name.value } : { team_id: f.team_id.value }),
+    };
+    await busy(form.querySelector("button[type=submit]"), async () => {
+      try {
+        await api("POST", "/api/signup", body);
+        location.href = "/";
+      } catch (err) {
+        const msg = err.code === "VALIDATION_FAILED"
+          ? "Please check the form: a valid email, a password of at least 8 characters, and a team."
+          : err.message;
+        showError($("#signup-error"), new Error(msg));
+      }
+    });
+  });
+}
+
 // ----------------------------------------------------------- overview ----
 
 const VIEW_LABELS = {
@@ -581,6 +624,6 @@ async function initItem() {
 
 // --------------------------------------------------------------- boot ----
 
-const pages = { login: initLogin, overview: initOverview, new: initNew, item: initItem };
+const pages = { login: initLogin, signup: initSignup, overview: initOverview, new: initNew, item: initItem };
 const init = pages[document.body.dataset.page];
 if (init) init().catch((err) => console.error(err));

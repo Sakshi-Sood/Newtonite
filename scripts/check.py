@@ -623,6 +623,96 @@ def check_change_is_committed_before_response_is_sent():
     assert seen["count"] == 1, "the client was told 201 before the item was committed"
 
 
+# ---- Sign-up --------------------------------------------------------------
+
+def signup_data(**kw):
+    from app.auth import SignupIn
+
+    n = _next()
+    return SignupIn(**{"name": f"New Person {n}", "email": f"{RUN}-{n}@check.test", "password": "longenough", **kw})
+
+
+def role_of(user_id) -> list[tuple]:
+    return [(r["name"], r["role"]) for r in sql(
+        "SELECT t.name, m.role FROM memberships m JOIN teams t ON t.id = m.team_id WHERE m.user_id = %s",
+        (user_id,))]
+
+
+def check_signup_new_team_makes_lead_and_logs_in():
+    from app.main import create_app
+
+    app = create_app()
+    app.state.pool = pool
+    n = _next()
+    body = {"name": "Founder", "email": f"{RUN}-{n}@CHECK.test", "password": "longenough",
+            "new_team_name": f"check-{RUN}-{n}"}
+    status, h, raw = asgi(app, "POST", "/api/signup", body)
+    assert status == 201, (status, raw)
+    cookie = h["set-cookie"].split(";")[0]
+    status, _, raw = asgi(app, "GET", "/api/me", headers={"cookie": cookie})
+    me = __import__("json").loads(raw)
+    assert status == 200 and me["user"]["email"] == f"{RUN}-{n}@check.test"  # stored lower-case
+    assert [(t["name"], t["role"]) for t in me["teams"]] == [(f"check-{RUN}-{n}", "lead")]
+    # and the new account can log in with its password
+    status, _, _ = asgi(app, "POST", "/api/login", {"email": body["email"], "password": "longenough"})
+    assert status == 200
+
+
+def check_signup_join_existing_team_as_member():
+    from app.auth import signup
+
+    t = team()
+    u = call(signup, signup_data(team_id=t["id"]))
+    assert role_of(u["id"]) == [(t["name"], "member")]
+
+
+def check_signup_duplicate_email_409_case_insensitive():
+    from app.auth import signup
+
+    t = team()
+    first = signup_data(team_id=t["id"])
+    call(signup, first)
+    again = signup_data(team_id=t["id"], email=first.email.upper())
+    expect_error(lambda: call(signup, again), 409, "EMAIL_TAKEN")
+
+
+def check_signup_taken_team_name_409_creates_nothing():
+    from app.auth import signup
+
+    t = team()
+    data = signup_data(new_team_name=t["name"])
+    expect_error(lambda: call(signup, data), 409, "TEAM_NAME_TAKEN")
+    assert sql("SELECT 1 FROM users WHERE email = %s", (data.email,)) == [], "user row must roll back"
+
+
+def check_signup_needs_exactly_one_team_choice():
+    from pydantic import ValidationError
+
+    t = team()
+    for kw in ({}, {"team_id": t["id"], "new_team_name": "x"}):
+        try:
+            signup_data(**kw)
+            raise AssertionError(f"accepted {kw}")
+        except ValidationError:
+            pass
+    try:
+        signup_data(team_id=t["id"], password="short")
+        raise AssertionError("accepted a 5-character password")
+    except ValidationError:
+        pass
+
+
+def check_concurrent_signups_same_email_one_wins():
+    from app.auth import signup
+
+    t = team()
+    data = signup_data(team_id=t["id"])
+    with ThreadPoolExecutor(5) as ex:
+        results = list(ex.map(lambda _: outcome(lambda: call(signup, data)), range(5)))
+    assert sorted(c for c, _ in results) == ["EMAIL_TAKEN"] * 4 + ["ok"], [c for c, _ in results]
+    assert len(sql("SELECT 1 FROM users WHERE email = %s", (data.email,))) == 1
+
+
 # ---- runner ---------------------------------------------------------------
 
 def main() -> int:

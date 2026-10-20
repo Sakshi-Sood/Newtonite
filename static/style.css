@@ -132,3 +132,7 @@ table.items td.title a:hover { text-decoration: underline; }
 .timeline .when { color: var(--muted); font-size: 0.85rem; margin-left: 6px; }
 .timeline .comment { white-space: pre-wrap; margin-top: 4px; padding: 8px 10px; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; }
 .timeline .reason { color: var(--muted); }
+
+fieldset { border: 1px solid var(--border); border-radius: 8px; padding: 12px; margin: 0; }
+legend { font-weight: 600; padding: 0 4px; }
+[hidden] { display: none !important; }
