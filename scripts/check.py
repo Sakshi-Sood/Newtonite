@@ -7,6 +7,7 @@ everything it created (even when a check fails). Exit code 1 if any failed.
 import sys
 import traceback
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -201,6 +202,82 @@ def check_member_actions_on_unassigned_open():
     m = user("member", t["id"])
     acts = create(m, t["id"])["allowed_actions"]
     assert "claim" in acts and "start" not in acts and "assign" not in acts, acts
+
+
+# ---- Task 5: idempotency --------------------------------------------------
+
+def idem_create(u: dict, team_id, key: str | None, title: str = "Idem item"):
+    from app.idempotency import request_hash, run_idempotent
+    from app.items import ItemCreate, create_item
+
+    data = ItemCreate(team_id=team_id, title=title, type="task", priority="medium")
+    h = request_hash("POST", "/api/items", data.model_dump(mode="json"))
+    with tx() as conn:
+        return run_idempotent(conn, u["id"], key, h, lambda: (201, create_item(conn, u["id"], data)))
+
+
+def item_count(team_id) -> int:
+    return sql("SELECT count(*) AS n FROM work_items WHERE team_id = %s", (team_id,))[0]["n"]
+
+
+def check_same_key_twice_one_item():
+    t = team()
+    m = user("member", t["id"])
+    s1, b1, r1 = idem_create(m, t["id"], "k1")
+    s2, b2, r2 = idem_create(m, t["id"], "k1")
+    assert (s1, r1, s2, r2) == (201, False, 201, True)
+    assert b1 == b2 and item_count(t["id"]) == 1
+
+
+def check_same_key_different_body_422():
+    t = team()
+    m = user("member", t["id"])
+    idem_create(m, t["id"], "k1", title="First")
+    expect_error(lambda: idem_create(m, t["id"], "k1", title="Second"), 422, "IDEMPOTENCY_KEY_REUSED")
+
+
+def check_missing_key_400():
+    t = team()
+    m = user("member", t["id"])
+    expect_error(lambda: idem_create(m, t["id"], None), 400, "IDEMPOTENCY_KEY_REQUIRED")
+    assert item_count(t["id"]) == 0
+
+
+def check_keys_are_per_user():
+    t = team()
+    a, b = user("member", t["id"]), user("member", t["id"])
+    idem_create(a, t["id"], "shared")
+    idem_create(b, t["id"], "shared")
+    assert item_count(t["id"]) == 2
+
+
+def check_failed_call_does_not_burn_key():
+    from app.idempotency import run_idempotent
+
+    t = team()
+    m = user("member", t["id"])
+
+    def boom():
+        raise RuntimeError("simulated failure")
+
+    try:
+        with tx() as conn:
+            run_idempotent(conn, m["id"], "retry-me", "h", boom)
+    except RuntimeError:
+        pass
+    status, _, replayed = idem_create(m, t["id"], "retry-me")
+    assert (status, replayed) == (201, False) and item_count(t["id"]) == 1
+
+
+def check_concurrent_same_key_creates_one():
+    t = team()
+    m = user("member", t["id"])
+    with ThreadPoolExecutor(8) as ex:
+        results = list(ex.map(lambda _: idem_create(m, t["id"], "double-click"), range(8)))
+    ids = {body["id"] for _, body, _ in results}
+    assert len(ids) == 1, ids
+    assert item_count(t["id"]) == 1
+    assert sum(1 for _, _, replayed in results if not replayed) == 1
 
 
 # ---- runner ---------------------------------------------------------------
