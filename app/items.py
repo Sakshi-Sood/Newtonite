@@ -171,14 +171,16 @@ def get_item(conn: Connection, item_id: str, user_id) -> dict:
 
 def stale_error(conn: Connection, item_id, user_id, role: str) -> AppError:
     """409 carrying the item as it is now and who changed it last, so the client can show a diff."""
+    # Only kinds that bump the version count; a later comment didn't cause the conflict.
     last = conn.execute(
-        """SELECT u.name FROM activity a JOIN users u ON u.id = a.actor_id
-           WHERE a.work_item_id = %s ORDER BY a.id DESC LIMIT 1""",
+        """SELECT u.id, u.name FROM activity a JOIN users u ON u.id = a.actor_id
+           WHERE a.work_item_id = %s AND a.kind IN ('updated', 'assigned', 'status_changed')
+           ORDER BY a.id DESC LIMIT 1""",
         (item_id,),
     ).fetchone()
-    return AppError(409, "STALE_VERSION", "This item was changed by someone else since you loaded it.",
+    return AppError(409, "STALE_VERSION", "This item was changed since you loaded it.",
                     {"current": _fresh_dto(conn, item_id, user_id, role),
-                     "changed_by": last["name"] if last else None})
+                     "changed_by": {"id": last["id"], "name": last["name"]} if last else None})
 
 
 def update_item(conn: Connection, item_id: str, user_id, expected_version: int, changes: dict) -> dict:

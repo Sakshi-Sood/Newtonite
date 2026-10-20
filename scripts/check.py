@@ -318,7 +318,7 @@ def check_patch_old_version_409_db_unchanged():
     call(update_item, it["id"], m["id"], 1, {"title": "Second"})
     err = expect_error(lambda: call(update_item, it["id"], m["id"], 1, {"title": "Stale write"}), 409, "STALE_VERSION")
     assert err.details["current"]["version"] == 2 and err.details["current"]["title"] == "Second"
-    assert err.details["changed_by"] == "First Editor"
+    assert err.details["changed_by"]["name"] == "First Editor"
     assert sql("SELECT title FROM work_items WHERE id = %s", (it["id"],))[0]["title"] == "Second"
 
 
@@ -621,6 +621,19 @@ def check_change_is_committed_before_response_is_sent():
                         on_start=lambda: seen.setdefault("count", item_count(t["id"])))
     assert status == 201, status
     assert seen["count"] == 1, "the client was told 201 before the item was committed"
+
+
+def check_stale_names_the_editor_not_a_later_commenter():
+    from app.items import add_comment, update_item
+
+    t = team()
+    editor = user("member", t["id"], name="The Editor")
+    commenter = user("member", t["id"], name="The Commenter")
+    it = create(editor, t["id"])
+    call(update_item, it["id"], editor["id"], 1, {"title": "Edited"})
+    call(add_comment, it["id"], commenter["id"], "just a comment")  # doesn't change the item
+    err = expect_error(lambda: call(update_item, it["id"], commenter["id"], 1, {"title": "stale"}), 409, "STALE_VERSION")
+    assert err.details["changed_by"] == {"id": editor["id"], "name": "The Editor"}, err.details["changed_by"]
 
 
 # ---- Sign-up --------------------------------------------------------------
