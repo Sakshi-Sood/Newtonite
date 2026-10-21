@@ -90,7 +90,6 @@ const label = (s) => {
   return t.charAt(0).toUpperCase() + t.slice(1);
 };
 const PRIORITIES = ["urgent", "high", "medium", "low"];
-const TYPES = ["customer_issue", "engineering", "payment", "incident", "compliance", "task"];
 // Colours a team can give its statuses (the --col-* variables in style.css).
 const COLORS = ["blue", "violet", "green", "teal", "amber", "orange", "red", "pink", "slate"];
 const colorVar = (c) => `var(--col-${COLORS.includes(c) ? c : "slate"})`;
@@ -183,6 +182,34 @@ function lockTag(text = "Locked") {
 function fillSelect(select, values) {
   for (const v of values) select.append(el("option", { value: v }, label(v)));
 }
+
+// In-app replacement for confirm() and prompt(): a modal that resolves with the answer.
+// `input` ({ label, placeholder }) adds a text box. Resolves null when cancelled (Esc, Cancel).
+// `choices` ({ label, options: [{ value, label }] }) adds a list to pick from; the answer is the chosen value.
+function askModal({ title, message = null, confirmLabel = "Confirm", danger = false, input = null, choices = null }) {
+  return new Promise((resolve) => {
+    let answer = null;
+    const field = input
+      ? (input.single ? el("input", { value: input.value || "", maxlength: 40, required: true })
+        : el("textarea", { rows: 3, maxlength: 2000, placeholder: input.placeholder || "" }))
+      : choices ? el("select", {}, choices.options.map((o) => el("option", { value: o.value }, o.label))) : null;
+    const form = el("form", { class: "stack" },
+      el("h2", {}, title),
+      message ? el("p", {}, message) : null,
+      field ? el("label", {}, (input || choices).label, field) : null,
+      el("div", { class: "row ask-actions" },
+        el("button", { type: "button", onclick: () => dialog.close() }, "Cancel"),
+        el("button", { type: "submit", class: danger ? "danger" : "primary" }, confirmLabel)));
+    const dialog = el("dialog", { class: "ask-dialog", "aria-label": title }, form);
+    form.addEventListener("submit", (ev) => { ev.preventDefault(); answer = field ? field.value.trim() : true; dialog.close(); });
+    // (a chosen value can be "": that still means "confirmed")
+    dialog.addEventListener("close", () => { dialog.remove(); resolve(answer); });
+    document.body.append(dialog);
+    dialog.showModal();
+  });
+}
+const confirmModal = async (options) => (await askModal(options)) !== null;
+const promptModal = (options) => askModal(options);
 
 function showError(node, err) {
   node.textContent = err ? err.message : "";
@@ -291,12 +318,37 @@ const canMove = (item) => item.allowed_actions.includes("move");
 const moveIntents = new Map();
 // Move a task to `status` (any status of its team). Returns the updated task, or null.
 async function moveItem(item, status) {
-  const k = `${item.id}:${status.id}:${item.version}`;
+  if (status.kind === "unassigned" && item.status.kind !== "unassigned") {
+    const ok = await confirmModal({
+      title: `Move to ${status.name}?`,
+      message: `"${item.title}" will move to ${status.name}.` + (item.assignee ? ` Its assignee, ${item.assignee.name}, will be removed from it.` : ""),
+      confirmLabel: item.assignee ? "Remove assignee and move" : "Move",
+      danger: !!item.assignee,
+    });
+    if (!ok) return null;
+  }
+  // Leaving Unassigned for a real status: ask who should work on it (whoever may assign it).
+  let assigneeId = null;
+  if (item.status.kind === "unassigned" && status.kind !== "unassigned" && !item.assignee && item.allowed_actions.includes("assign")) {
+    const people = (await teamMembers(item.team.id)) || [];
+    if (people.length) {
+      const picked = await askModal({
+        title: "Assign this task?",
+        message: `"${item.title}" is leaving ${item.status.name} for ${status.name}. Who should work on it?`,
+        choices: { label: "Assign to", options: [{ value: "", label: "Nobody yet" }, ...people.map((p) => ({ value: p.id, label: p.name }))] },
+        confirmLabel: "Move task",
+      });
+      if (picked === null) return null;
+      assigneeId = picked || null;
+    }
+  }
+  const k = `${item.id}:${status.id}:${item.version}:${assigneeId || ""}`;
   const it = moveIntents.get(k) ?? intent();
   moveIntents.set(k, it);
   try {
     const updated = await api("POST", `/api/items/${item.id}/status`,
-      { status_id: status.id, expected_version: item.version }, { idempotencyKey: it.key() });
+      { status_id: status.id, expected_version: item.version, ...(assigneeId ? { assignee_id: assigneeId } : {}) },
+      { idempotencyKey: it.key() });
     it.settle(null);
     moveIntents.delete(k);
     flash(`"${updated.title}" moved to ${status.name}.`, true);
@@ -440,10 +492,47 @@ const VIEW_LABELS = {
   requested_by_me: "Requested by me",
 };
 
+// Fill a task type <select> with one team's types. Picks `currentId` if the team has it, else the type
+// named `preferName`, else the first. Returns how many types there are, or null if a newer call owns the select.
+async function fillTypeOptions(select, teamId, { currentId = null, preferName = "Task" } = {}) {
+  select.dataset.team = teamId;
+  let list = [];
+  try { list = await api("GET", `/api/teams/${encodeURIComponent(teamId)}/types`); } catch { /* none to offer */ }
+  if (select.dataset.team !== teamId) return null;
+  select.replaceChildren(...list.map((t) => el("option", { value: t.id }, t.name)));
+  const pick = list.find((t) => t.id === currentId) || list.find((t) => t.name.toLowerCase() === preferName.toLowerCase()) || list[0];
+  if (pick) select.value = pick.id;
+  return list.length;
+}
+
+// Fill a project <select> with the projects of one team ("No project" first). Returns how many
+// there are, or null if the team changed while the request was running (a newer call owns the select).
+async function fillProjectOptions(select, teamId, current = null) {
+  select.dataset.team = teamId;
+  let list = [];
+  try { list = await api("GET", `/api/projects?team_id=${encodeURIComponent(teamId)}`); } catch { /* none to offer */ }
+  if (select.dataset.team !== teamId) return null;
+  select.replaceChildren(el("option", { value: "" }, "No project"), ...list.map((p) => el("option", { value: p.id }, p.name)));
+  select.value = current && list.some((p) => p.id === current) ? current : "";
+  return list.length;
+}
+
+function projectTag(project) {
+  return el("span", { class: "tag project", title: "Project" }, project.name);
+}
+
+// Every project of the teams I'm in, once each (for the project filter).
+function myProjects(me) {
+  const seen = new Map();
+  for (const t of me.teams) for (const p of t.projects || []) seen.set(p.id, p);
+  return [...seen.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+
 function titleCell(it) {
   return el("td", { class: "title" },
     el("a", { href: `/item.html?id=${it.id}` }, it.title),
     it.restricted ? [" ", lockTag()] : null,
+    it.project ? [" ", projectTag(it.project)] : null,
     approvalTag(it) ? [" ", approvalTag(it)] : null,
     it.my_role === "requester" ? [" ", el("span", { class: "tag" }, "Your request")] : null);
 }
@@ -462,8 +551,9 @@ async function initOverview() {
     }
   }
   fillSelect(form.elements.priority, PRIORITIES);
+  for (const p of myProjects(me)) form.elements.project.append(el("option", { value: p.id }, p.name));
 
-  const FIELDS = ["q", "team_id", "status", "priority", "assignee", "sort"];
+  const FIELDS = ["q", "team_id", "project", "status", "priority", "assignee", "sort"];
   const params = () => new URLSearchParams(location.search);
   let requestSeq = 0; // ignore responses that arrive after a newer request
 
@@ -592,7 +682,7 @@ async function initOverview() {
     typing = setTimeout(() => setParams({ q: form.elements.q.value.trim() }, { push: false }), 300);
   });
   form.addEventListener("submit", (ev) => ev.preventDefault());
-  for (const f of ["team_id", "status", "priority", "assignee", "sort"]) {
+  for (const f of ["team_id", "project", "status", "priority", "assignee", "sort"]) {
     form.elements[f].addEventListener("change", () => setParams({ [f]: form.elements[f].value }));
   }
   $("#clear-filters").addEventListener("click", () => { history.pushState(null, "", location.pathname); load(); });
@@ -630,16 +720,28 @@ async function initBoard() {
 
   // The board shows one team at a time: every team has its own statuses.
   const teamSelect = $("#board-team");
+  const projectSelect = $("#board-project");
   teamSelect.replaceChildren(...me.teams.map((t) => el("option", { value: t.id }, t.name)));
   const url = () => new URLSearchParams(location.search);
   const teamId = () => (me.teams.some((t) => t.id === url().get("team_id")) ? url().get("team_id") : me.teams[0].id);
   const team = () => me.teams.find((t) => t.id === teamId());
+  // The project filter: one of this team's projects, or "none"; anything else means "all".
+  const projectId = () => {
+    const v = url().get("project");
+    return v === "none" || team().projects?.some((p) => p.id === v) ? v : "";
+  };
+  function fillProjectFilter() {
+    projectSelect.replaceChildren(el("option", { value: "" }, "All projects"), el("option", { value: "none" }, "No project"),
+      ...(team().projects || []).map((p) => el("option", { value: p.id }, p.name)));
+    projectSelect.value = projectId();
+  }
   const activeChips = () => new Set((url().get("chips") || "").split(",").filter((c) => c in CHIPS));
 
   function filterParams() {
     const p = new URLSearchParams();
     for (const chip of activeChips()) for (const [k, v] of Object.entries(CHIPS[chip].params)) p.set(k, v);
     p.set("team_id", teamId());
+    if (projectId()) p.set("project", projectId());
     if (url().get("q")) p.set("q", url().get("q"));
     return p;
   }
@@ -663,7 +765,8 @@ async function initBoard() {
       setUrl({ chips: [...set].join(",") });
     });
   }
-  teamSelect.addEventListener("change", () => setUrl({ team_id: teamSelect.value }));
+  teamSelect.addEventListener("change", () => setUrl({ team_id: teamSelect.value, project: "" }));
+  projectSelect.addEventListener("change", () => setUrl({ project: projectSelect.value }));
   let typing;
   $("#board-q").addEventListener("input", () => {
     clearTimeout(typing);
@@ -685,7 +788,8 @@ async function initBoard() {
     },
       el("a", { class: "title", href: `/item.html?id=${it.id}`, draggable: "false" }, it.title),
       el("div", { class: "meta" },
-        prioBadge(it.priority), el("span", { class: "tag" }, label(it.type)),
+        prioBadge(it.priority), el("span", { class: "tag" }, it.type.name),
+        it.project ? projectTag(it.project) : null,
         approvalTag(it),
         it.restricted ? lockTag() : null),
       el("div", { class: "foot" }, avatar(it.assignee),
@@ -818,6 +922,7 @@ async function initBoard() {
       me.teams = fresh.teams;
       setStatuses(me);
       teamSelect.value = teamId();
+      fillProjectFilter();
       $("#manage-statuses").hidden = team().role !== "lead";
       const counts = await api("GET", `/api/items/counts?${filterParams()}`);
       if (seq !== loadSeq) return;
@@ -967,13 +1072,20 @@ async function initNew() {
   const f = form.elements;
   const allTeams = await api("GET", "/api/teams");
   teamOptions(f.team_id, me, allTeams, me.teams[0]?.id);
-  fillSelect(f.type, TYPES);
   fillSelect(f.priority, PRIORITIES);
   f.priority.value = "medium";
   const create = intent();
 
+  async function syncProjects() {
+    const n = await fillProjectOptions(f.project_id, f.team_id.value);
+    if (n !== null) $("#project-field").hidden = n === 0;
+  }
+
   async function syncTeam() {
+    syncProjects();
+    fillTypeOptions(f.type_id, f.team_id.value).then(syncTypeInput);
     const role = await fillAssignees(f.assignee_id, f.team_id.value, me);
+    setTypeTyping(role === "lead" || me.user.is_admin);
     $("#assignee-field").hidden = role === null;
     $("#assignee-hint").textContent = role ? "You'll be able to reassign it later; the person you assign can't pass it on." : "";
     // Leads can always edit, so restricting is only offered to other creators.
@@ -983,14 +1095,122 @@ async function initNew() {
       ? "You're not in this team, so this becomes a request: they do the work, and you can follow, comment on and edit it under Requested by me."
       : "";
   }
+  // Leads and admins get a type-ahead box instead of the plain list: pick a type, or type a new
+  // name and press Enter to add it to the team. Everyone else just picks from the list.
+  const typeInput = $("#type-input");
+  let typing = false;
+  const typeNames = () => [...f.type_id.options].map((o) => o.textContent);
+  const typeNamed = (name) => [...f.type_id.options].find((o) => o.textContent.toLowerCase() === name.trim().toLowerCase());
+
+  function setTypeTyping(on) {
+    typing = on;
+    f.type_id.hidden = on;
+    f.type_id.required = !on;
+    typeInput.hidden = !on;
+    $("#type-hint").hidden = !on;
+    syncTypeInput();
+  }
+
+  function syncTypeInput() {
+    $("#type-options").replaceChildren(...typeNames().map((n) => el("option", { value: n })));
+    typeInput.value = f.type_id.selectedOptions[0]?.textContent || "";
+    updateTypeTools();
+  }
+
+  // Rename and Remove act on the chosen type, named on the buttons.
+  function updateTypeTools() {
+    const name = f.type_id.selectedOptions[0]?.textContent || "";
+    $("#type-rename").textContent = name ? `Rename “${name}”` : "Rename";
+    $("#type-remove").textContent = name ? `Remove “${name}”` : "Remove";
+    $("#type-rename").disabled = $("#type-remove").disabled = !name;
+  }
+
+  $("#type-rename").addEventListener("click", async () => {
+    const option = f.type_id.selectedOptions[0];
+    if (!option) return;
+    const name = await promptModal({ title: `Rename “${option.textContent}”`, message: "Its tasks keep the type; only the name changes.",
+      input: { label: "New name", value: option.textContent, single: true }, confirmLabel: "Rename" });
+    if (!name || name === option.textContent) return;
+    try {
+      const renamed = await api("PATCH", `/api/teams/${f.team_id.value}/types/${option.value}`, { name });
+      option.textContent = renamed.name;
+      syncTypeInput();
+      showError($("#new-error"), null);
+      flash(`Renamed to "${renamed.name}".`, true);
+    } catch (err) {
+      showError($("#new-error"), err);
+    }
+  });
+
+  $("#type-remove").addEventListener("click", async () => {
+    const option = f.type_id.selectedOptions[0];
+    if (!option) return;
+    const name = option.textContent;
+    if (!(await confirmModal({ title: `Remove “${name}”?`, message: "It won't be available for new tasks.",
+      confirmLabel: "Remove type", danger: true }))) return;
+    const url = `/api/teams/${f.team_id.value}/types/${option.value}`;
+    try {
+      try {
+        await api("DELETE", url);
+      } catch (err) {
+        if (err.code !== "TYPE_IN_USE") throw err;
+        const n = err.details.task_count;
+        const to = await askModal({
+          title: `Move ${n} ${n === 1 ? "task" : "tasks"} to another type?`,
+          message: `“${name}” is used by ${n} ${n === 1 ? "task" : "tasks"}. Choose the type they should get instead.`,
+          choices: { label: "New type", options: [...f.type_id.options].filter((o) => o !== option).map((o) => ({ value: o.value, label: o.textContent })) },
+          confirmLabel: "Move and remove", danger: true,
+        });
+        if (to === null) return;
+        await api("DELETE", `${url}?move_to=${to}`);
+      }
+      await fillTypeOptions(f.type_id, f.team_id.value);
+      syncTypeInput();
+      showError($("#new-error"), null);
+      flash(`Removed “${name}”.`, true);
+    } catch (err) {
+      showError($("#new-error"), err);
+    }
+  });
+
+  // Make what's typed the chosen type, creating it first if the team doesn't have it. Returns false on failure.
+  async function commitType() {
+    const name = typeInput.value.trim();
+    if (!typing || !name) return true;
+    const existing = typeNamed(name);
+    if (existing) { f.type_id.value = existing.value; typeInput.value = existing.textContent; return true; }
+    try {
+      const made = await api("POST", `/api/teams/${f.team_id.value}/types`, { name });
+      f.type_id.append(el("option", { value: made.id }, made.name));
+      f.type_id.value = made.id;
+      syncTypeInput();
+      flash(`"${made.name}" added as a task type for ${f.team_id.selectedOptions[0].textContent}.`, true);
+      return true;
+    } catch (err) {
+      showError($("#new-error"), err);
+      return false;
+    }
+  }
+
+  // The list of suggestions only shows names matching the text, so empty the box while it has focus.
+  typeInput.addEventListener("focus", () => { typeInput.dataset.was = typeInput.value; typeInput.value = ""; });
+  typeInput.addEventListener("blur", () => { if (!typeInput.value.trim()) typeInput.value = typeInput.dataset.was || ""; });
+  typeInput.addEventListener("input", () => { const t = typeNamed(typeInput.value); if (t) { f.type_id.value = t.value; updateTypeTools(); } });
+  typeInput.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Enter") return;
+    ev.preventDefault();  // Enter adds the type; it must not submit the form
+    commitType();
+  });
   f.team_id.addEventListener("change", syncTeam);
   await syncTeam();
 
   form.addEventListener("submit", async (ev) => {
     ev.preventDefault();
+    if (!(await commitType())) return;
     const body = {
       team_id: f.team_id.value, title: f.title.value, description: f.description.value,
-      type: f.type.value, priority: f.priority.value,
+      type_id: f.type_id.value, priority: f.priority.value,
+      project_id: $("#project-field").hidden ? null : f.project_id.value || null,
       requires_approval: f.requires_approval.checked, restricted: f.restricted.checked,
       due_at: f.due_at.value ? new Date(f.due_at.value).toISOString() : null,
       assignee_id: $("#assignee-field").hidden ? null : f.assignee_id.value || null,
@@ -1034,6 +1254,7 @@ function describe(entry) {
       const parts = Object.entries(p.changes || {}).map(([field, c]) => {
         if (field === "description") return "edited the description";
         if (field === "team") return `moved it from ${c.from} to ${c.to}`;
+        if (field === "project") return c.to ? `${c.from ? `moved it from project “${c.from}” to “${c.to}”` : `added it to project “${c.to}”`}` : `removed it from project “${c.from}”`;
         if (field === "restricted") return c.to ? "restricted editing to leads and the creator" : "opened editing to the team";
         if (field === "due_at") return `changed the due date to ${c.to ? new Date(c.to).toLocaleString() : "none"}`;
         return `changed ${label(field).toLowerCase()} from “${c.from ?? "none"}” to “${c.to ?? "none"}”`;
@@ -1048,6 +1269,7 @@ function describe(entry) {
 const flat = (it) => ({
   title: it.title, description: it.description, priority: it.priority, due_at: it.due_at,
   restricted: it.restricted, team_id: it.team.id, assignee_id: it.assignee ? it.assignee.id : null,
+  project_id: it.project ? it.project.id : null, type_id: it.type.id,
 });
 
 async function initItem() {
@@ -1091,7 +1313,8 @@ async function initItem() {
     $("#header").replaceChildren(
       el("h1", {}, item.title),
       el("div", { class: "badges" }, statusBadge(item.status), prioBadge(item.priority), approvalTag(item),
-        el("span", { class: "tag" }, label(item.type)), el("span", { class: "tag" }, item.team.name),
+        el("span", { class: "tag" }, item.type.name), el("span", { class: "tag" }, item.team.name),
+        item.project ? projectTag(item.project) : null,
         item.restricted ? lockTag("Locked: only leads and the creator edit details") : null,
         item.my_role === "requester" ? el("span", { class: "tag" }, "Your request to this team") : null),
     );
@@ -1113,6 +1336,7 @@ async function initItem() {
     $("#meta").replaceChildren(
       el("dl", {},
         el("dt", {}, "Status"), el("dd", {}, statusSelect(item, (updated) => { item = updated; render(); loadTimeline(); })),
+        el("dt", {}, "Project"), el("dd", {}, item.project ? item.project.name : "None"),
         el("dt", {}, "Assignee"), el("dd", {}, el("span", { class: "who" }, avatar(item.assignee), item.assignee ? item.assignee.name : "Unassigned")),
         item.assignee && item.assigned_by ? el("dt", {}, "Assigned by") : null,
         item.assignee && item.assigned_by ? el("dd", {}, item.assigned_by.name) : null,
@@ -1184,7 +1408,8 @@ async function initItem() {
   async function decide(decision, button) {
     let reason = null;
     if (decision === "reject") {
-      reason = window.prompt("Why are you rejecting this task? (optional)");
+      reason = await promptModal({ title: "Reject this task?", message: "Tell the team why (optional).",
+        input: { label: "Reason" }, confirmLabel: "Reject", danger: true });
       if (reason === null) return;
     }
     await busy(button, async () => {
@@ -1224,6 +1449,10 @@ async function initItem() {
     const can = (a) => item.allowed_actions.includes(a);
     const teamSelect = el("select", { name: "team_id" });
     teamOptions(teamSelect, me, allTeams, item.team.id);
+    const typeSelect = el("select", { name: "type_id" });
+    const projectSelect = el("select", { name: "project_id" });
+    const projectField = el("label", {}, "Project", projectSelect,
+      el("span", { class: "hint" }, "Only projects assigned to the task's team can be chosen. Moving it to a team that isn't on its project removes the project."));
     const assigneeSelect = el("select", { name: "assignee_id" });
     const assigneeField = el("label", {}, "Assign to", assigneeSelect,
       el("span", { class: "hint" }, "Leads and whoever assigned the task can reassign it. The person it's assigned to can't pass it on."));
@@ -1232,9 +1461,11 @@ async function initItem() {
       el("label", {}, "Description", el("textarea", { name: "description", rows: 8, maxlength: 20000 })),
       el("div", { class: "row" },
         el("label", {}, "Priority", el("select", { name: "priority" }, PRIORITIES.map((p) => el("option", { value: p }, label(p))))),
+        el("label", {}, "Type", typeSelect),
         el("label", {}, "Due", el("input", { name: "due_at", type: "datetime-local", value: toLocalInput(item.due_at) }))),
       el("label", {}, "Team", teamSelect,
         el("span", { class: "hint" }, "Moving it to another team hands the work over. If the assignee isn't in that team, it becomes unassigned.")),
+      projectField,
       assigneeField,
       can("restrict") ? el("label", { class: "check" },
         el("input", { name: "restricted", type: "checkbox", checked: item.restricted }),
@@ -1259,8 +1490,13 @@ async function initItem() {
         assigneeField.hidden = !(can("assign") && role !== null);
       }
     }
-    teamSelect.addEventListener("change", syncAssignees);
-    await syncAssignees();
+    async function syncProjects() {
+      const n = await fillProjectOptions(projectSelect, teamSelect.value, item.project ? item.project.id : null);
+      if (n !== null) projectField.hidden = n === 0 && !item.project;
+    }
+    const syncTypes = () => fillTypeOptions(typeSelect, teamSelect.value, { currentId: item.type.id, preferName: item.type.name });
+    teamSelect.addEventListener("change", () => { syncAssignees(); syncProjects(); syncTypes(); });
+    await Promise.all([syncAssignees(), syncProjects(), syncTypes()]);
 
     form.addEventListener("submit", (ev) => { ev.preventDefault(); save(editing.baseVersion); });
     $("#editor").replaceChildren(form);
@@ -1286,6 +1522,8 @@ async function initItem() {
       due_at: f.due_at.value ? new Date(f.due_at.value).toISOString() : null,
       team_id: f.team_id.value,
     };
+    if (f.type_id.value) out.type_id = f.type_id.value;
+    if (!f.project_id.closest("label").hidden) out.project_id = f.project_id.value || null;
     if (f.restricted) out.restricted = f.restricted.checked;
     if (!f.assignee_id.closest("label").hidden) out.assignee_id = f.assignee_id.value || null;
     return out;
@@ -1331,11 +1569,19 @@ async function initItem() {
         || (current.assignee && current.assignee.id === value ? current.assignee.name : null)
         || (value === me.user.id ? me.user.name : "Someone");
     }
+    if (field === "type_id") {
+      const option = [...document.querySelectorAll("#edit-form [name=type_id] option")].find((o) => o.value === value);
+      return option ? option.textContent : current.type.name;
+    }
+    if (field === "project_id") {
+      const option = [...document.querySelectorAll("#edit-form [name=project_id] option")].find((o) => o.value === value);
+      return option ? option.textContent : current.project?.name || "Another project";
+    }
     if (field === "restricted") return value ? "Leads and creator only" : "Anyone in the team";
     if (field === "due_at") return new Date(value).toLocaleString();
     return String(value);
   };
-  const FIELD_NAMES = { team_id: "Team", assignee_id: "Assignee", restricted: "Editing", due_at: "Due" };
+  const FIELD_NAMES = { team_id: "Team", project_id: "Project", type_id: "Type", assignee_id: "Assignee", restricted: "Editing", due_at: "Due" };
 
   // Keep the user's draft; show only the fields they changed next to the server's values now.
   function showConflict({ current, changed_by }) {
@@ -1485,7 +1731,7 @@ async function initProfile() {
 const pages = {
   login: initLogin, setup: initSetup, "change-password": initChangePassword, overview: initOverview,
   board: initBoard, new: initNew, item: initItem,
-  admin: () => initAdmin({ api, el, $, topbar, flash, showError, busy, label, avatar, newKey, setRefresh }),
+  admin: () => initAdmin({ api, el, $, topbar, flash, showError, busy, label, avatar, newKey, setRefresh, confirmModal }),
   profile: initProfile,
 };
 const init = pages[document.body.dataset.page];

@@ -53,6 +53,27 @@ To do with approval pending, and **Blocked** / **Cancelled** become custom statu
 (Cancelled counts as finished) in teams that had such tasks. Take a backup first
 if the data matters (`pg_dump`).
 
+### Projects
+
+Admins create projects (Admin → Projects) and choose which teams work on each one.
+A task can be put in one project of its own team, from the new-task form or the
+task's Edit form, and the list and board can be filtered by project. Taking a team
+off a project, or deleting the project, never deletes tasks: they leave the
+project and the open ones move to the team's new default **Unassigned** status.
+`python -m app.migrate` adds the tables and gives every existing team that status.
+
+### Task types
+
+Task types belong to each team. A team starts with Customer issue, Engineering,
+Payment, Incident, Compliance and Task, and its leads and admins can rename, add and
+remove any of them from the New task form: in the Type field, type a new name and press Enter to
+add it, or use **Rename** / **Remove** under the field for the chosen type. The last type can't be removed, and removing one that tasks use asks which
+type those tasks should get. The first `python -m app.migrate` after this change
+converts the old fixed types; every task keeps its type.
+
+Moving a task into the **Unassigned** status asks for confirmation and removes the
+task's assignee. Moving a task out of Unassigned asks who should work on it.
+
 ### Accounts and admins
 
 There is **no public sign-up**. Everyone's account is created by an **admin**.

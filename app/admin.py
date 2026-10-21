@@ -13,7 +13,7 @@ from typing import Literal
 from psycopg import Connection
 from pydantic import BaseModel, model_validator
 
-from app import statuses
+from app import statuses, task_types
 from app.auth import Email, Name, Password, hash_password
 from app.errors import AppError
 
@@ -120,6 +120,7 @@ def create_team(conn: Connection, data: TeamIn) -> dict:
     if row is None:
         raise AppError(409, "TEAM_NAME_TAKEN", f"A team called \"{data.name}\" already exists.")
     statuses.create_defaults(conn, row["id"])
+    task_types.create_defaults(conn, row["id"])
     return {**row, "member_count": 0, "lead_count": 0, "lead_names": "", "total_tasks": 0, "open_tasks": 0}
 
 

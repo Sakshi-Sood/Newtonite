@@ -21,7 +21,7 @@ CREATE TABLE statuses (
     id       uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     team_id  uuid NOT NULL REFERENCES teams (id) ON DELETE CASCADE,
     name     text NOT NULL,
-    kind     text NOT NULL CHECK (kind IN ('todo', 'in_progress', 'completed', 'custom')),
+    kind     text NOT NULL CHECK (kind IN ('todo', 'in_progress', 'completed', 'unassigned', 'custom')),
     color    text NOT NULL DEFAULT 'slate',
     finished boolean NOT NULL DEFAULT false,
     position integer NOT NULL,
@@ -81,13 +81,82 @@ def migrate_statuses(conn: psycopg.Connection) -> bool:
     return True
 
 
+PROJECT_STATEMENTS = [
+    """CREATE TABLE IF NOT EXISTS projects (
+           id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+           name        text NOT NULL,
+           description text NOT NULL DEFAULT '',
+           created_at  timestamptz NOT NULL DEFAULT now())""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS projects_name_idx ON projects (lower(name))",
+    """CREATE TABLE IF NOT EXISTS project_teams (
+           project_id uuid NOT NULL REFERENCES projects (id) ON DELETE CASCADE,
+           team_id    uuid NOT NULL REFERENCES teams (id) ON DELETE CASCADE,
+           PRIMARY KEY (project_id, team_id))""",
+    "CREATE INDEX IF NOT EXISTS project_teams_team_idx ON project_teams (team_id)",
+    "ALTER TABLE work_items ADD COLUMN IF NOT EXISTS project_id uuid REFERENCES projects (id) ON DELETE SET NULL",
+    "CREATE INDEX IF NOT EXISTS work_items_project_idx ON work_items (project_id) WHERE project_id IS NOT NULL",
+    # Allow the new default status kind.
+    "ALTER TABLE statuses DROP CONSTRAINT IF EXISTS statuses_kind_check",
+    """ALTER TABLE statuses ADD CONSTRAINT statuses_kind_check
+           CHECK (kind IN ('todo', 'in_progress', 'completed', 'unassigned', 'custom'))""",
+    # A team's own custom status called "Unassigned" would clash with the new default: keep it, renamed.
+    "UPDATE statuses SET name = name || ' (custom)' WHERE kind = 'custom' AND lower(name) = 'unassigned'",
+    """INSERT INTO statuses (team_id, name, kind, color, finished, position)
+       SELECT t.id, 'Unassigned', 'unassigned', 'amber', false,
+              (SELECT coalesce(max(s.position), 0) + 1 FROM statuses s WHERE s.team_id = t.id)
+       FROM teams t
+       WHERE NOT EXISTS (SELECT 1 FROM statuses s WHERE s.team_id = t.id AND s.kind = 'unassigned')""",
+]
+
+
+TYPE_TABLE = """
+CREATE TABLE task_types (
+    id       uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    team_id  uuid NOT NULL REFERENCES teams (id) ON DELETE CASCADE,
+    name     text NOT NULL,
+    position integer NOT NULL
+);
+CREATE UNIQUE INDEX task_types_team_name_idx ON task_types (team_id, lower(name));
+"""
+
+OLD_TYPES = (("customer_issue", "Customer issue"), ("engineering", "Engineering"), ("payment", "Payment"),
+             ("incident", "Incident"), ("compliance", "Compliance"), ("task", "Task"))
+
+
+def migrate_types(conn: psycopg.Connection) -> bool:
+    """Replace the fixed list of task types with per-team types. Returns True if it ran.
+
+    Every team gets the six old types as editable types, and each task keeps its type.
+    """
+    already = conn.execute("""SELECT 1 FROM information_schema.columns
+                              WHERE table_name = 'work_items' AND column_name = 'type_id'""").fetchone()
+    if already:
+        return False
+    conn.execute(TYPE_TABLE)
+    for position, (_, name) in enumerate(OLD_TYPES, start=1):
+        conn.execute("INSERT INTO task_types (team_id, name, position) SELECT id, %s, %s FROM teams", (name, position))
+    conn.execute("ALTER TABLE work_items ADD COLUMN type_id uuid REFERENCES task_types (id)")
+    for old, name in OLD_TYPES:
+        conn.execute("""UPDATE work_items w SET type_id = ty.id FROM task_types ty
+                        WHERE ty.team_id = w.team_id AND ty.name = %s AND w.type::text = %s""", (name, old))
+    conn.execute("ALTER TABLE work_items ALTER COLUMN type_id SET NOT NULL")
+    conn.execute("ALTER TABLE work_items DROP COLUMN type")
+    conn.execute("DROP TYPE IF EXISTS item_type")
+    conn.execute("CREATE INDEX IF NOT EXISTS work_items_type_idx ON work_items (type_id)")
+    return True
+
+
 def main() -> None:
     with psycopg.connect(DATABASE_URL) as conn:
         for stmt in STATEMENTS:
             conn.execute(stmt)
         converted = migrate_statuses(conn)
-    print(f"Database up to date ({len(STATEMENTS)} statements applied"
-          f"{'; statuses converted to per-team statuses' if converted else ''}).")
+        types_converted = migrate_types(conn)
+        for stmt in PROJECT_STATEMENTS:  # after the status conversion: they rely on per-team statuses
+            conn.execute(stmt)
+    print(f"Database up to date ({len(STATEMENTS) + len(PROJECT_STATEMENTS)} statements applied"
+          f"{'; statuses converted to per-team statuses' if converted else ''}"
+          f"{'; task types converted to per-team types' if types_converted else ''}).")
 
 
 if __name__ == "__main__":

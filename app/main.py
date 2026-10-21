@@ -10,12 +10,22 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
 
-from app import admin_routes, auth, events, profile, routes, status_routes
+from app import admin_routes, auth, events, profile, routes, status_routes, type_routes
 from app.config import DATABASE_URL, SECRET_KEY
 from app.db import create_pool
 from app.errors import install_handlers
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+
+
+class RevalidatingStatic(StaticFiles):
+    """Static files the browser must re-check on every load (a cheap 304 when unchanged),
+    so a changed script is never hidden behind a stale cached copy."""
+
+    def file_response(self, *args, **kwargs):
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
 
 
 @asynccontextmanager
@@ -36,11 +46,12 @@ def create_app() -> FastAPI:
     app.include_router(routes.router)
     app.include_router(routes.overview_router)
     app.include_router(status_routes.router)
+    app.include_router(type_routes.router)
     app.include_router(profile.router)
     app.include_router(admin_routes.router)
     app.include_router(events.router)
     # Static frontend last, so /api routes take precedence.
-    app.mount("/", StaticFiles(directory=STATIC_DIR, html=True, check_dir=False), name="static")
+    app.mount("/", RevalidatingStatic(directory=STATIC_DIR, html=True, check_dir=False), name="static")
     return app
 
 

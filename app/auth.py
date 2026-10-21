@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, Request, Response
 from psycopg import Connection
 from pydantic import BaseModel, StringConstraints
 
-from app import statuses
+from app import projects, statuses, task_types
 from app.db import Conn
 from app.errors import AppError
 
@@ -162,7 +162,12 @@ def me(user: SessionUser, conn: Conn):
         (user["id"],),
     ).fetchall()
     by_team = statuses.for_user(conn, user["id"])
-    return {"user": public_user(user), "teams": [{**t, "statuses": by_team.get(str(t["id"]), [])} for t in teams]}
+    projects_by_team = projects.for_user(conn, user["id"])
+    types_by_team = task_types.for_user(conn, user["id"])
+    return {"user": public_user(user), "teams": [
+        {**t, "statuses": by_team.get(str(t["id"]), []), "projects": projects_by_team.get(str(t["id"]), []),
+         "types": types_by_team.get(str(t["id"]), [])}
+        for t in teams]}
 
 
 @router.get("/teams/{team_id}/members")

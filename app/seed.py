@@ -16,6 +16,7 @@ from app.auth import hash_password
 from app.config import DATABASE_URL
 from app.db import apply_schema
 from app.statuses import create_defaults
+from app.task_types import create_defaults as create_default_types
 
 TEAMS = ["Payments", "Platform", "Support", "Compliance", "Customer Success", "Infrastructure"]
 
@@ -71,12 +72,15 @@ def main() -> None:
                     for name in TEAMS}
         members: dict[str, list[tuple[uuid.UUID, str]]] = {name: [] for name in TEAMS}
         status_ids: dict[str, dict[str, uuid.UUID]] = {}
+        type_ids: dict[str, dict[str, uuid.UUID]] = {}
         for name, tid in team_ids.items():
             create_defaults(conn, tid)
-            for position, (sname, color, finished) in enumerate(CUSTOM, start=4):
+            create_default_types(conn, tid)
+            for position, (sname, color, finished) in enumerate(CUSTOM, start=5):
                 conn.execute("""INSERT INTO statuses (team_id, name, kind, color, finished, position)
                                 VALUES (%s, %s, 'custom', %s, %s, %s)""", (tid, sname, color, finished, position))
             status_ids[name] = {r[0]: r[1] for r in conn.execute("SELECT name, id FROM statuses WHERE team_id = %s", (tid,))}
+            type_ids[name] = {r[0]: r[1] for r in conn.execute("SELECT name, id FROM task_types WHERE team_id = %s", (tid,))}
 
         def add_user(email: str, name: str, teams: dict[str, str]) -> None:
             uid = conn.execute("INSERT INTO users (email, name, password_hash) VALUES (%s, %s, %s) RETURNING id",
@@ -118,7 +122,7 @@ def main() -> None:
             item_rows.append((
                 item_id, team_ids[team], f"{rng.choice(TITLES[item_type])} #{1000 + n}",
                 f"Reported via the {team} queue. Investigate, act, and record the outcome here.",
-                item_type, pick(rng, PRIORITY_WEIGHTS), status_ids[team][status],
+                type_ids[team][item_type.replace('_', ' ').capitalize()], pick(rng, PRIORITY_WEIGHTS), status_ids[team][status],
                 rng.choice(people) if needs_assignee else None,
                 needs_approval, approval, due_at, rng.choice(people),
                 created_at, last_activity, last_activity,
@@ -128,7 +132,7 @@ def main() -> None:
         with conn.cursor() as cur:
             for i in range(0, len(item_rows), 1000):
                 cur.executemany(
-                    """INSERT INTO work_items (id, team_id, title, description, type, priority, status_id,
+                    """INSERT INTO work_items (id, team_id, title, description, type_id, priority, status_id,
                            assignee_id, requires_approval, approval, due_at, created_by, created_at, updated_at,
                            last_activity_at)
                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
