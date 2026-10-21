@@ -9,7 +9,7 @@ function generatePassword(length = 12) {
 }
 
 export async function initAdmin(ctx) {
-  const { api, el, $, topbar, flash, showError, busy, avatar, setRefresh } = ctx;
+  const { api, el, $, topbar, flash, showError, busy, avatar, setRefresh, confirmModal } = ctx;
   const me = await topbar("admin");
   if (!me.user.is_admin) {
     $("#admin-denied").hidden = false;
@@ -34,7 +34,7 @@ export async function initAdmin(ctx) {
     onDialogClose = onClose || (() => {});
     if (!dlg.open) dlg.showModal();
   }
-  dlg.addEventListener("close", () => { onDialogClose(); loadSummary(); loadTeams(true); loadUsers(true); });
+  dlg.addEventListener("close", () => { onDialogClose(); loadSummary(); loadTeams(true); loadProjects(true); loadUsers(true); });
   $("#admin-dialog-close").addEventListener("click", () => dlg.close());
   const dialogError = () => el("p", { class: "error", hidden: true, role: "alert" });
 
@@ -49,16 +49,17 @@ export async function initAdmin(ctx) {
 
   // ------------------------------------------------------------------- tabs
   function showTab(name) {
-    for (const t of ["teams", "users"]) {
+    for (const t of ["teams", "projects", "users"]) {
       const on = t === name;
       $(`#tab-${t}`).setAttribute("aria-selected", String(on));
       $(`#panel-${t}`).hidden = !on;
     }
-    history.replaceState(null, "", name === "users" ? "#users" : location.pathname);
+    history.replaceState(null, "", name === "teams" ? location.pathname : `#${name}`);
   }
   $("#tab-teams").addEventListener("click", () => showTab("teams"));
+  $("#tab-projects").addEventListener("click", () => showTab("projects"));
   $("#tab-users").addEventListener("click", () => showTab("users"));
-  if (location.hash === "#users") showTab("users");
+  if (location.hash === "#users" || location.hash === "#projects") showTab(location.hash.slice(1));
 
   // ------------------------------------------------------------------- teams
   const teamsState = { q: "", page: 1, rows: [], more: false };
@@ -179,8 +180,9 @@ export async function initAdmin(ctx) {
           el("span", { class: "who-block" }, el("strong", {}, m.name), m.active ? null : el("span", { class: "tag" }, " Deactivated"), el("br"),
             el("span", { class: "muted" }, m.email)),
           role,
-          el("button", { type: "button", class: "danger", onclick: () => {
-            if (!window.confirm(`Remove ${m.name} from ${team.name}? Their tasks in this team become unassigned.`)) return;
+          el("button", { type: "button", class: "danger", onclick: async () => {
+            if (!(await confirmModal({ title: `Remove ${m.name}?`, confirmLabel: "Remove", danger: true,
+              message: `${m.name} leaves ${team.name}, and their tasks in this team become unassigned.` }))) return;
             mutate(() => api("DELETE", `/api/admin/users/${m.id}/teams/${team.id}`));
           } }, "Remove"));
       });
@@ -214,6 +216,145 @@ export async function initAdmin(ctx) {
         el("p", { class: "hint" }, "A team with members always needs at least one lead, so add a lead first."),
         err);
       find();
+    }
+    await render();
+  }
+
+  // ---------------------------------------------------------------- projects
+  const projectsState = { q: "", page: 1, rows: [], more: false };
+
+  async function loadProjects(reset) {
+    if (reset) projectsState.page = 1;
+    const pages = reset ? Math.max(1, Math.ceil(projectsState.rows.length / 50)) : 1;
+    try {
+      let rows = [], more = false;
+      for (let p = 1; p <= pages; p++) {
+        const page = reset ? p : projectsState.page;
+        const data = await api("GET", `/api/admin/projects?q=${encodeURIComponent(projectsState.q)}&page=${page}&page_size=50`);
+        rows = rows.concat(data.items);
+        more = data.has_more;
+      }
+      projectsState.rows = reset ? rows : projectsState.rows.concat(rows);
+      projectsState.more = more;
+      renderProjects();
+      showError($("#projects-error"), null);
+    } catch (err) {
+      showError($("#projects-error"), err);
+    }
+  }
+
+  function renderProjects() {
+    $("#projects-rows").replaceChildren(...projectsState.rows.map((p) => el("tr", {},
+      el("td", { class: "title" }, p.name, p.description ? [el("br"), el("span", { class: "muted" }, p.description)] : null),
+      el("td", {}, p.teams.length ? el("span", { class: "chip-list" }, p.teams.map((t) => el("span", { class: "tag" }, t.name)))
+        : el("span", { class: "warn-text" }, "No teams yet")),
+      el("td", {}, `${p.open_tasks} of ${p.total_tasks}`),
+      el("td", { class: "row-actions" },
+        el("button", { type: "button", onclick: () => projectTeamsDialog(p) }, "Teams"),
+        el("button", { type: "button", onclick: () => editProjectDialog(p) }, "Edit"),
+        el("button", { type: "button", class: "danger", onclick: () => deleteProjectDialog(p) }, "Delete")))));
+    $("#projects-empty").hidden = projectsState.rows.length > 0;
+    $("#projects-more").hidden = !projectsState.more;
+  }
+
+  $("#project-q").addEventListener("input", debounce((ev) => { projectsState.q = ev.target.value.trim(); loadProjects(true); }));
+  $("#projects-more").addEventListener("click", () => { projectsState.page += 1; loadProjects(false); });
+  const projectForm = $("#project-create");
+  projectForm.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    await busy(projectForm.querySelector("button"), async () => {
+      try {
+        const p = await api("POST", "/api/admin/projects", { name: projectForm.elements.name.value });
+        projectForm.reset();
+        flash(`Project "${p.name}" created. Choose which teams work on it.`, true);
+        await loadProjects(true);
+        projectTeamsDialog(p);
+      } catch (err) {
+        showError($("#projects-error"), new Error(messageOf(err)));
+      }
+    });
+  });
+
+  function editProjectDialog(project) {
+    const err = dialogError();
+    const form = el("form", { class: "stack" },
+      el("label", {}, "Project name", el("input", { name: "name", value: project.name, maxlength: 100, required: true })),
+      el("label", {}, "Description (optional)", el("textarea", { name: "description", rows: 4, maxlength: 2000 })),
+      err, el("div", {}, el("button", { type: "submit", class: "primary" }, "Save project")));
+    form.elements.description.value = project.description || "";
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      await busy(form.querySelector("button"), async () => {
+        try {
+          await api("PATCH", `/api/admin/projects/${project.id}`,
+            { name: form.elements.name.value, description: form.elements.description.value });
+          flash("Project saved.", true);
+          dlg.close();
+        } catch (e) { showError(err, new Error(messageOf(e))); }
+      });
+    });
+    openDialog(`Edit ${project.name}`, form);
+  }
+
+  function deleteProjectDialog(project) {
+    const err = dialogError();
+    const confirmInput = el("input", { name: "confirm", autocomplete: "off", "aria-label": "Type the project name to confirm" });
+    const button = el("button", { type: "submit", class: "danger", disabled: true }, "Delete project");
+    confirmInput.addEventListener("input", () => { button.disabled = confirmInput.value.trim() !== project.name; });
+    const form = el("form", { class: "stack" },
+      el("p", {}, `This deletes the project "${project.name}". Its ${plural(project.total_tasks, "task", "tasks")} are not deleted: `,
+        "they leave the project, and the open ones move to their team's Unassigned status. This can't be undone."),
+      el("label", {}, `Type "${project.name}" to confirm`, confirmInput), err, el("div", {}, button));
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      await busy(button, async () => {
+        try {
+          await api("DELETE", `/api/admin/projects/${project.id}`, { confirm_name: confirmInput.value });
+          flash(`Project "${project.name}" deleted.`, true);
+          dlg.close();
+        } catch (e) { showError(err, new Error(messageOf(e))); }
+      });
+    });
+    openDialog(`Delete ${project.name}?`, form);
+  }
+
+  // Which teams work on a project. Taking a team off releases that team's tasks from it.
+  async function projectTeamsDialog(project) {
+    const body = el("div", { class: "stack" });
+    const err = dialogError();
+    openDialog(`Teams on ${project.name}`, [body]);
+
+    async function render() {
+      let teams;
+      try { teams = await api("GET", `/api/admin/projects/${project.id}/teams`); } catch (e) { showError(err, e); return; }
+      const rows = teams.map((t) => {
+        const box = el("input", { type: "checkbox", checked: t.assigned, "aria-label": `${t.name} works on ${project.name}` });
+        box.addEventListener("change", async () => {
+          const adding = box.checked;
+          if (!adding && t.task_count > 0 && !(await confirmModal({
+            title: `Take ${t.name} off ${project.name}?`, confirmLabel: "Take team off", danger: true,
+            message: `Its ${plural(t.task_count, "task", "tasks")} in this project leave it, and the open ones move to the team's Unassigned status.`,
+          }))) {
+            box.checked = true;
+            return;
+          }
+          box.disabled = true;
+          try {
+            const out = await api(adding ? "PUT" : "DELETE", `/api/admin/projects/${project.id}/teams/${t.id}`);
+            showError(err, null);
+            if (out.released) flash(`${plural(out.released, "task", "tasks")} left the project.`, true);
+          } catch (e) {
+            showError(err, new Error(messageOf(e)));
+          }
+          await render();
+        });
+        return el("li", {}, el("label", {}, box, t.name,
+          t.task_count ? el("span", { class: "muted" }, plural(t.task_count, "task", "tasks")) : null));
+      });
+      body.replaceChildren(
+        teams.length ? el("ul", { class: "check-list" }, rows) : el("p", { class: "muted" }, "There are no teams yet."),
+        el("p", { class: "hint" }, "Members of a checked team can put their tasks in this project and filter by it."),
+        err);
     }
     await render();
   }
@@ -369,8 +510,9 @@ export async function initAdmin(ctx) {
           catch (e) { role.value = t.role; throw e; }
         }));
         return el("li", { class: "member-row" }, el("span", { class: "who-block" }, el("strong", {}, t.name)), role,
-          el("button", { type: "button", class: "danger", onclick: () => {
-            if (!window.confirm(`Remove ${user.name} from ${t.name}? Their tasks in this team become unassigned.`)) return;
+          el("button", { type: "button", class: "danger", onclick: async () => {
+            if (!(await confirmModal({ title: `Remove ${user.name}?`, confirmLabel: "Remove", danger: true,
+              message: `${user.name} leaves ${t.name}, and their tasks in this team become unassigned.` }))) return;
             run(() => api("DELETE", `/api/admin/users/${user.id}/teams/${t.team_id}`));
           } }, "Remove"));
       });
@@ -412,6 +554,6 @@ export async function initAdmin(ctx) {
     return p;
   }
 
-  setRefresh(() => { loadSummary(); loadTeams(true); loadUsers(true); });
-  await Promise.all([loadSummary(), loadTeams(true), loadUsers(true)]);
+  setRefresh(() => { loadSummary(); loadTeams(true); loadProjects(true); loadUsers(true); });
+  await Promise.all([loadSummary(), loadTeams(true), loadProjects(true), loadUsers(true)]);
 }

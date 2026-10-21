@@ -10,14 +10,13 @@ from psycopg import Connection
 from psycopg.types.json import Jsonb
 from pydantic import AfterValidator, BaseModel, StringConstraints, model_validator
 
-from app import statuses as st
+from app import projects, statuses as st, task_types
 from app.errors import AppError
 from app.notify import publish
-from app.rules import ITEM_TYPES, PRIORITIES, allowed_actions, can
+from app.rules import PRIORITIES, allowed_actions, can
 
 Title = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
 Description = Annotated[str, StringConstraints(max_length=20000)]
-ItemType = Literal[ITEM_TYPES]
 Priority = Literal[PRIORITIES]
 # Times without a zone are taken as UTC, so they compare cleanly with stored timestamptz values.
 AwareDatetime = Annotated[datetime, AfterValidator(lambda d: d if d.tzinfo else d.replace(tzinfo=timezone.utc))]
@@ -26,17 +25,20 @@ EDITABLE = ("title", "description", "priority", "due_at")  # plain detail fields
 # A task together with its status. `closed` = in a finished status, or rejected by a lead.
 ITEM_SQL = """
     SELECT w.*, s.name AS status_name, s.kind AS status_kind, s.color AS status_color,
-           s.finished AS status_finished,
+           s.finished AS status_finished, pr.name AS project_name, ty.name AS type_name,
            (s.finished OR COALESCE(w.approval = 'rejected', false)) AS closed
-    FROM work_items w JOIN statuses s ON s.id = w.status_id"""
+    FROM work_items w JOIN statuses s ON s.id = w.status_id
+    LEFT JOIN projects pr ON pr.id = w.project_id
+    JOIN task_types ty ON ty.id = w.type_id"""
 
 
 class ItemCreate(BaseModel):
     team_id: uuid.UUID
     title: Title
     description: Description = ""
-    type: ItemType
+    type_id: uuid.UUID                    # one of the team's task types
     priority: Priority
+    project_id: uuid.UUID | None = None   # one of the team's projects
     requires_approval: bool = False
     restricted: bool = False
     due_at: AwareDatetime | None = None
@@ -48,9 +50,11 @@ class ItemPatch(BaseModel):
     title: Title | None = None
     description: Description | None = None
     priority: Priority | None = None
+    type_id: uuid.UUID | None = None      # another of the team's types
     due_at: AwareDatetime | None = None  # explicit null clears the due date
     restricted: bool | None = None
     team_id: uuid.UUID | None = None      # move to another team
+    project_id: uuid.UUID | None = None   # explicit null removes the project
     assignee_id: uuid.UUID | None = None  # explicit null unassigns
 
     @model_validator(mode="after")
@@ -58,13 +62,13 @@ class ItemPatch(BaseModel):
         sent = self.model_fields_set - {"expected_version"}
         if not sent:
             raise ValueError("Send at least one field to change.")
-        for field in ("title", "description", "priority", "restricted", "team_id"):
+        for field in ("title", "description", "priority", "restricted", "team_id", "type_id"):
             if field in sent and getattr(self, field) is None:
                 raise ValueError(f"{field} cannot be null.")
         return self
 
     def changes(self) -> dict:
-        fields = EDITABLE + ("restricted", "team_id", "assignee_id")
+        fields = EDITABLE + ("restricted", "team_id", "assignee_id", "project_id", "type_id")
         return {f: getattr(self, f) for f in fields if f in self.model_fields_set}
 
 
@@ -80,6 +84,7 @@ class AssignIn(BaseModel):
 class MoveIn(BaseModel):
     status_id: uuid.UUID
     expected_version: int
+    assignee_id: uuid.UUID | None = None  # assign the task in the same step (leads; not into Unassigned)
 
 
 class ApprovalIn(BaseModel):
@@ -163,8 +168,9 @@ def item_dto(conn: Connection, row: dict, user_id, role: str) -> dict:
         "team": {"id": row["team_id"], "name": names["team_name"]},
         "title": row["title"],
         "description": row["description"],
-        "type": row["type"],
+        "type": {"id": row["type_id"], "name": row["type_name"]},
         "priority": row["priority"],
+        "project": {"id": row["project_id"], "name": row["project_name"]} if row["project_id"] else None,
         "status": {"id": row["status_id"], "name": row["status_name"], "kind": row["status_kind"],
                    "color": row["status_color"], "finished": row["status_finished"]},
         "requires_approval": row["requires_approval"],
@@ -220,13 +226,16 @@ def create_item(conn: Connection, user_id, data: ItemCreate) -> dict:
     if data.restricted and role == "lead":
         raise AppError(403, "FORBIDDEN", "Leads can always edit, so restricting is only for other creators.",
                        {"permission": "restrict"})
+    task_types.require_in_team(conn, data.team_id, data.type_id)
+    if data.project_id is not None:
+        projects.require_taggable(conn, data.team_id, data.project_id)
     todo = st.default_status_id(conn, data.team_id, "todo")
     row = conn.execute(
-        """INSERT INTO work_items (team_id, title, description, type, priority, status_id,
+        """INSERT INTO work_items (team_id, title, description, type_id, priority, status_id, project_id,
                                    requires_approval, approval, restricted, due_at, assignee_id, assigned_by,
                                    created_by)
-           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
-        (data.team_id, data.title, data.description, data.type, data.priority, todo,
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+        (data.team_id, data.title, data.description, data.type_id, data.priority, todo, data.project_id,
          data.requires_approval, "pending" if data.requires_approval else None, data.restricted, data.due_at,
          data.assignee_id, user_id if data.assignee_id else None, user_id),
     ).fetchone()
@@ -261,7 +270,7 @@ def _team_name(conn: Connection, team_id) -> str:
     return conn.execute("SELECT name FROM teams WHERE id = %s", (team_id,)).fetchone()["name"]
 
 
-UPDATABLE = EDITABLE + ("restricted", "team_id", "assignee_id")
+UPDATABLE = EDITABLE + ("restricted", "team_id", "assignee_id", "project_id", "type_id")
 
 
 def update_item(conn: Connection, item_id: str, user_id, expected_version: int, changes: dict) -> dict:
@@ -283,6 +292,14 @@ def update_item(conn: Connection, item_id: str, user_id, expected_version: int, 
         # The task keeps its place in the workflow: same default status, or the
         # custom one with the same name, otherwise To do.
         changed["status_id"] = st.equivalent_in(conn, row["status_id"], team_id)
+    if changed.get("type_id") is not None:
+        task_types.require_in_team(conn, team_id, changed["type_id"])
+    elif "type_id" not in changed and "team_id" in changed:
+        changed["type_id"] = task_types.equivalent_in(conn, row["type_id"], team_id)  # same name there, else its first type
+    if changed.get("project_id") is not None:
+        projects.require_taggable(conn, team_id, changed["project_id"])
+    elif "project_id" not in changed and "team_id" in changed and row["project_id"]             and not projects.is_on_team(conn, team_id, row["project_id"]):
+        changed["project_id"] = None  # the new team isn't on the task's project
     if "assignee_id" in changed:
         taking_it = str(changed["assignee_id"]) == str(user_id) and can(row, user_id, role, "claim")
         if not taking_it:
@@ -303,7 +320,11 @@ def update_item(conn: Connection, item_id: str, user_id, expected_version: int, 
         raise stale_error(conn, row["id"], user_id, role)
 
     details = {f: {"from": row[f], "to": v} for f, v in changed.items()
-               if f not in ("team_id", "assignee_id", "assigned_by", "status_id")}
+               if f not in ("team_id", "assignee_id", "assigned_by", "status_id", "project_id", "type_id")}
+    if "type_id" in changed:
+        details["type"] = {"from": row["type_name"], "to": task_types.name_of(conn, changed["type_id"])}
+    if "project_id" in changed:
+        details["project"] = {"from": row["project_name"], "to": projects.name_of(conn, changed["project_id"])}
     if "team_id" in changed:
         details["team"] = {"from": _team_name(conn, row["team_id"]), "to": _team_name(conn, team_id)}
         new_status = conn.execute("SELECT name FROM statuses WHERE id = %s", (changed["status_id"],)).fetchone()["name"]
@@ -382,9 +403,11 @@ def assign_item(conn: Connection, item_id: str, user_id, assignee_id, expected_v
     return _fresh_dto(conn, row["id"], user_id, role)
 
 
-def move_item(conn: Connection, item_id: str, user_id, status_id, expected_version: int) -> dict:
+def move_item(conn: Connection, item_id: str, user_id, status_id, expected_version: int, assignee_id=None) -> dict:
     """Change a task's status to any status of its team. The assignee or a lead may
-    do it, unless a lead still has to approve the task."""
+    do it, unless a lead still has to approve the task. Moving into Unassigned also
+    removes the assignee; `assignee_id` assigns the task in the same step (needs the
+    assign permission, and makes no sense for Unassigned)."""
     # Row lock: concurrent moves of one task run one after another.
     row, role = load_item(conn, item_id, user_id, for_update=True)
     if row["version"] != expected_version:
@@ -400,11 +423,25 @@ def move_item(conn: Connection, item_id: str, user_id, status_id, expected_versi
     require(row, user_id, role, "move")
     if target["id"] == row["status_id"]:
         return item_dto(conn, row, user_id, role)
-    conn.execute("UPDATE work_items SET status_id = %s, version = version + 1, updated_at = now() WHERE id = %s",
-                 (target["id"], row["id"]))
+    if assignee_id is not None:
+        if target["kind"] == "unassigned":
+            raise AppError(422, "INVALID_ASSIGNEE", "A task in Unassigned has no assignee.")
+        require(row, user_id, role, "assign")
+        _check_assignee(conn, row["team_id"], assignee_id)
+    # Moving a task into Unassigned also takes its assignee off it.
+    drops_assignee = target["kind"] == "unassigned" and row["assignee_id"] is not None
+    assigns = assignee_id is not None and str(assignee_id) != str(row["assignee_id"])
+    conn.execute(
+        """UPDATE work_items SET status_id = %s, version = version + 1, updated_at = now(),
+                  assignee_id = CASE WHEN %s THEN NULL WHEN %s THEN %s::uuid ELSE assignee_id END,
+                  assigned_by = CASE WHEN %s THEN NULL WHEN %s THEN %s::uuid ELSE assigned_by END WHERE id = %s""",
+        (target["id"], drops_assignee, assigns, assignee_id, drops_assignee, assigns, user_id, row["id"]))
     record_activity(conn, row["id"], user_id, "status_changed",
                     {"from": row["status_name"], "to": target["name"], "from_id": row["status_id"],
                      "to_id": target["id"], "to_color": target["color"]})
+    if drops_assignee or assigns:
+        record_activity(conn, row["id"], user_id, "assigned",
+                        _assignment_payload(conn, row["assignee_id"], None if drops_assignee else assignee_id))
     return _fresh_dto(conn, row["id"], user_id, role)
 
 

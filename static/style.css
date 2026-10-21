@@ -415,3 +415,13 @@ tr.inactive-row td { opacity: 0.65; }
 #admin-dialog-body h3 { margin: 6px 0 0; font-family: var(--font-head); font-size: 1rem; }
 pre.credentials { background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--radius-s);
                   padding: 12px; margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; user-select: all; }
+
+.tag.project { background: color-mix(in srgb, var(--brand) 12%, var(--surface)); color: var(--brand); font-weight: 600; }
+.check-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+.check-list label { display: flex; gap: 8px; align-items: center; }
+.check-list .muted { margin-left: auto; }
+.ask-dialog { width: min(440px, 94vw); }
+.ask-dialog h2 { margin: 0; }
+.ask-actions { justify-content: flex-end; }
+.type-tools { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.type-tools .hint { flex: 1 1 260px; }

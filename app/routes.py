@@ -5,7 +5,7 @@ from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse
 from psycopg import Connection
 
-from app import items, listing
+from app import items, listing, projects
 from app.auth import User
 from app.db import Conn
 from app.idempotency import request_hash, run_idempotent
@@ -23,12 +23,19 @@ def overview(user: User, conn: Conn):
     return {"counts": listing.overview_counts(conn, user["id"])}
 
 
+@overview_router.get("/projects")
+def visible_projects(user: User, conn: Conn, team_id: str | None = None):
+    """Projects for pickers and filters (one team's, or those of the caller's own teams)."""
+    return projects.list_visible(conn, user["id"], team_id)
+
+
 @router.get("")
 def list_items(
     user: User,
     conn: Conn,
     view: str | None = None,
     team_id: str | None = None,
+    project: str | None = None,
     status: str | None = None,
     status_id: str | None = None,
     priority: str | None = None,
@@ -40,7 +47,7 @@ def list_items(
     page_size: int = Query(25, ge=1, le=100),
 ):
     return listing.list_items(
-        conn, user["id"], view=view, team_id=team_id, status=_csv(status), status_id=status_id,
+        conn, user["id"], view=view, team_id=team_id, project=project, status=_csv(status), status_id=status_id,
         priority=_csv(priority), type=_csv(type), assignee=assignee, q=q, sort=sort, page=page,
         page_size=page_size,
     )
@@ -53,13 +60,14 @@ def status_counts(
     conn: Conn,
     view: str | None = None,
     team_id: str | None = None,
+    project: str | None = None,
     priority: str | None = None,
     type: str | None = None,
     assignee: str | None = None,
     q: str | None = None,
 ):
     """Tasks per status id for one team (`team_id` is required: statuses are per team)."""
-    return listing.status_counts(conn, user["id"], view=view, team_id=team_id, priority=_csv(priority),
+    return listing.status_counts(conn, user["id"], view=view, team_id=team_id, project=project, priority=_csv(priority),
                                  type=_csv(type), assignee=assignee, q=q)
 
 
@@ -122,7 +130,7 @@ def move_item(
     user: User, conn: Conn,
 ):
     return _idempotent(request, conn, user, body.model_dump(mode="json"), lambda: (
-        200, items.move_item(conn, item_id, user["id"], body.status_id, body.expected_version)))
+        200, items.move_item(conn, item_id, user["id"], body.status_id, body.expected_version, body.assignee_id)))
 
 
 @router.post("/{item_id}/approval")

@@ -12,19 +12,33 @@
   <header id="topbar"></header>
   <main class="narrow">
     <h1>New task</h1>
+    <div id="flash" class="flash" hidden></div>
     <form id="new-form" class="card stack">
       <label>Team
         <select name="team_id" required></select>
         <span class="hint" id="team-hint"></span>
+      </label>
+      <label id="project-field" hidden>Project
+        <select name="project_id"><option value="">No project</option></select>
+        <span class="hint">Only projects assigned to the chosen team are listed.</span>
       </label>
       <label>Title <input name="title" maxlength="200" required placeholder="What needs to happen?"></label>
       <label>Description
         <textarea name="description" rows="6" maxlength="20000" placeholder="Why does this exist? What is known so far?"></textarea>
       </label>
       <div class="row">
-        <label>Type <select name="type" required></select></label>
+        <label>Type
+          <select name="type_id" required></select>
+          <input id="type-input" list="type-options" maxlength="40" autocomplete="off" hidden placeholder="Pick a type, or type a new one" aria-label="Type">
+          <datalist id="type-options"></datalist>
+        </label>
         <label>Priority <select name="priority" required></select></label>
         <label>Due <input name="due_at" type="datetime-local"></label>
+      </div>
+      <div class="type-tools" id="type-hint" hidden>
+        <span class="hint">Type a name that isn't in the list and press Enter to add it as a task type for this team.</span>
+        <button type="button" id="type-rename">Rename</button>
+        <button type="button" id="type-remove" class="danger">Remove</button>
       </div>
       <label id="assignee-field">Assign to
         <select name="assignee_id"><option value="">Nobody yet</option></select>

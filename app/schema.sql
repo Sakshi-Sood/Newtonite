@@ -1,11 +1,9 @@
 -- Whole schema. Safe to re-run: it drops everything first.
-DROP TABLE IF EXISTS idempotency_keys, activity, work_items, statuses, memberships, teams, users CASCADE;
-DROP TYPE IF EXISTS item_status, item_priority, item_type CASCADE;
+DROP TABLE IF EXISTS idempotency_keys, activity, work_items, task_types, statuses, project_teams, projects, memberships, teams, users CASCADE;
+DROP TYPE IF EXISTS item_status, item_priority, item_type CASCADE;  -- item_type: the old fixed list of task types
 
 -- Declaration order is sort order: ORDER BY priority puts urgent first.
 CREATE TYPE item_priority AS ENUM ('urgent', 'high', 'medium', 'low');
-CREATE TYPE item_type AS ENUM
-    ('customer_issue', 'engineering', 'payment', 'incident', 'compliance', 'task');
 
 CREATE TABLE users (
     id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -30,13 +28,40 @@ CREATE TABLE memberships (
 );
 CREATE INDEX memberships_team_idx ON memberships (team_id);
 
--- Per-team board columns. Three defaults per team (todo / in_progress / completed)
--- plus custom ones; `finished` ones take their tasks out of the "needs attention" views.
+-- Projects are made by admins and assigned to any number of teams (and a team to any
+-- number of projects). A task may be tagged with one project of its own team.
+CREATE TABLE projects (
+    id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    name        text NOT NULL,
+    description text NOT NULL DEFAULT '',
+    created_at  timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX projects_name_idx ON projects (lower(name));
+
+CREATE TABLE project_teams (
+    project_id uuid NOT NULL REFERENCES projects (id) ON DELETE CASCADE,
+    team_id    uuid NOT NULL REFERENCES teams (id) ON DELETE CASCADE,
+    PRIMARY KEY (project_id, team_id)
+);
+CREATE INDEX project_teams_team_idx ON project_teams (team_id);
+
+-- Per-team task types. A new team starts with six; its leads and admins rename, add and remove them.
+CREATE TABLE task_types (
+    id       uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    team_id  uuid NOT NULL REFERENCES teams (id) ON DELETE CASCADE,
+    name     text NOT NULL,
+    position integer NOT NULL
+);
+CREATE UNIQUE INDEX task_types_team_name_idx ON task_types (team_id, lower(name));
+
+-- Per-team board columns. Four defaults per team (todo / in_progress / completed /
+-- unassigned) plus custom ones; `finished` ones take their tasks out of the "needs
+-- attention" views. `unassigned` is where tasks land when their project is taken away.
 CREATE TABLE statuses (
     id       uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     team_id  uuid NOT NULL REFERENCES teams (id) ON DELETE CASCADE,
     name     text NOT NULL,
-    kind     text NOT NULL CHECK (kind IN ('todo', 'in_progress', 'completed', 'custom')),
+    kind     text NOT NULL CHECK (kind IN ('todo', 'in_progress', 'completed', 'unassigned', 'custom')),
     color    text NOT NULL DEFAULT 'slate',
     finished boolean NOT NULL DEFAULT false,
     position integer NOT NULL,
@@ -52,10 +77,11 @@ CREATE TABLE work_items (
     team_id           uuid NOT NULL REFERENCES teams (id) ON DELETE CASCADE,
     title             text NOT NULL,
     description       text NOT NULL DEFAULT '',
-    type              item_type NOT NULL,
+    type_id           uuid NOT NULL REFERENCES task_types (id),  -- must be a type of team_id
     priority          item_priority NOT NULL,
     status_id         uuid NOT NULL REFERENCES statuses (id),
-    assignee_id       uuid REFERENCES users (id) ON DELETE SET NULL,
+    project_id        uuid REFERENCES projects (id) ON DELETE SET NULL,  -- must be a project of team_id
+    assignee_id      uuid REFERENCES users (id) ON DELETE SET NULL,
     assigned_by       uuid REFERENCES users (id) ON DELETE SET NULL,  -- who made the current assignment
     requires_approval boolean NOT NULL,
     approval          text CHECK (approval IN ('pending', 'approved', 'rejected')),  -- NULL = no approval needed
@@ -77,6 +103,8 @@ CREATE INDEX work_items_team_status_idx
     ON work_items (team_id, status_id, priority, last_activity_at DESC);
 CREATE INDEX work_items_assignee_idx ON work_items (assignee_id, status_id);
 CREATE INDEX work_items_created_by_idx ON work_items (created_by);
+CREATE INDEX work_items_type_idx ON work_items (type_id);
+CREATE INDEX work_items_project_idx ON work_items (project_id) WHERE project_id IS NOT NULL;
 
 -- Append-only history of everything that happened to an item (comments included).
 CREATE TABLE activity (

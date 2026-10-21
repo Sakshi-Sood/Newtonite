@@ -20,6 +20,7 @@
 
       <div class="subtabs" role="tablist" aria-label="Admin sections">
         <button type="button" role="tab" id="tab-teams" aria-selected="true" aria-controls="panel-teams">Teams</button>
+        <button type="button" role="tab" id="tab-projects" aria-selected="false" aria-controls="panel-projects">Projects</button>
         <button type="button" role="tab" id="tab-users" aria-selected="false" aria-controls="panel-users">Users</button>
       </div>
 
@@ -40,6 +41,25 @@
           <p id="teams-empty" class="empty-state" hidden>No teams yet. Create the first one above.</p>
         </div>
         <p><button type="button" id="teams-more" hidden>Show more teams</button></p>
+      </section>
+
+      <section id="panel-projects" role="tabpanel" aria-labelledby="tab-projects" hidden>
+        <div class="admin-toolbar">
+          <input id="project-q" type="search" placeholder="Search projects" aria-label="Search projects">
+          <form id="project-create" class="inline-form">
+            <input name="name" maxlength="100" required placeholder="New project name" aria-label="New project name">
+            <button type="submit" class="primary">Create project</button>
+          </form>
+        </div>
+        <p id="projects-error" class="error" hidden></p>
+        <div class="table-wrap">
+          <table class="items admin-table">
+            <thead><tr><th scope="col">Project</th><th scope="col">Teams</th><th scope="col">Open tasks</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead>
+            <tbody id="projects-rows"></tbody>
+          </table>
+          <p id="projects-empty" class="empty-state" hidden>No projects yet. Create the first one above, then assign teams to it.</p>
+        </div>
+        <p><button type="button" id="projects-more" hidden>Show more projects</button></p>
       </section>
 
       <section id="panel-users" role="tabpanel" aria-labelledby="tab-users" hidden>

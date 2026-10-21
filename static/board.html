@@ -16,6 +16,7 @@
     <div id="flash" class="flash" hidden></div>
     <div id="board-tools" class="chips" role="toolbar" aria-label="Quick filters">
       <select id="board-team" aria-label="Team"></select>
+      <select id="board-project" aria-label="Project"></select>
       <button type="button" class="chip" data-chip="mine" aria-pressed="false">My tasks</button>
       <button type="button" class="chip" data-chip="unassigned" aria-pressed="false">Unassigned</button>
       <button type="button" class="chip" data-chip="urgent" aria-pressed="false">Urgent &amp; high</button>
@@ -41,7 +42,7 @@
       <h2 id="status-title">Statuses for <span id="status-team"></span></h2>
       <button type="button" id="status-close" aria-label="Close">Close</button>
     </div>
-    <p class="muted">These are the board's columns. To do, In progress and Completed are fixed; add your own, rename them,
+    <p class="muted">These are the board's columns. To do, In progress, Completed and Unassigned are fixed; add your own, rename them,
       pick colours and reorder them. A status that <em>counts as finished</em> takes its tasks out of Overdue and Assigned to me.</p>
     <p id="status-error" class="error" hidden></p>
     <ul id="status-list" class="status-list"></ul>

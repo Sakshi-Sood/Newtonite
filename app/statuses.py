@@ -1,7 +1,7 @@
 """Task statuses, per team.
 
-Every team has three default statuses that can't be renamed or deleted
-(To do, In progress, Completed) and any number of custom ones its leads add.
+Every team has four default statuses that can't be renamed or deleted
+(To do, In progress, Completed, Unassigned) and any number of custom ones its leads add.
 A status can be marked "finished": tasks in it stop counting as overdue, stale
 or "assigned to me", and can no longer be edited, claimed or reassigned.
 """
@@ -21,6 +21,7 @@ DEFAULTS = (
     ("To do", "todo", False, "blue"),
     ("In progress", "in_progress", False, "violet"),
     ("Completed", "completed", True, "green"),
+    ("Unassigned", "unassigned", False, "amber"),  # where tasks go when their project is taken away
 )
 StatusName = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=40)]
 Color = Literal[COLORS]

@@ -8,7 +8,6 @@ whether a task is *closed* (in a finished status, or rejected by a lead) and
 about its approval step.
 """
 
-ITEM_TYPES = ("customer_issue", "engineering", "payment", "incident", "compliance", "task")
 PRIORITIES = ("urgent", "high", "medium", "low")
 ROLES = ("member", "lead")  # team membership roles; "requester" is derived (created it, not in the team)
 APPROVAL_STATES = ("pending", "approved", "rejected")

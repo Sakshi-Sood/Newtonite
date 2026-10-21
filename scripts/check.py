@@ -44,11 +44,17 @@ def sql(query: str, params=()) -> list[dict]:
 
 def team() -> dict:
     from app.statuses import create_defaults
+    from app.task_types import create_defaults as create_default_types
 
     row = sql("INSERT INTO teams (name) VALUES (%s) RETURNING *", (f"check-{RUN}-{_next()}",))[0]
     with tx() as conn:
-        create_defaults(conn, row["id"])  # To do / In progress / Completed
+        create_defaults(conn, row["id"])  # To do / In progress / Completed / Unassigned
+        create_default_types(conn, row["id"])  # Customer issue ... Task
     return row
+
+
+def type_id(team_id, name: str = "Task"):
+    return sql("SELECT id FROM task_types WHERE team_id = %s AND name = %s", (team_id, name))[0]["id"]
 
 
 def status_id(team_id, kind: str = "todo"):
@@ -89,7 +95,7 @@ def item(created_by: dict, team_id, status: str = "todo", **overrides) -> dict:
     (todo / in_progress / completed); pass status_id=... for a custom status."""
     fields = {
         "team_id": team_id, "title": f"Check item {_next()}", "description": "",
-        "type": "task", "priority": "medium", "status_id": status_id(team_id, status),
+        "type_id": type_id(team_id), "priority": "medium", "status_id": status_id(team_id, status),
         "requires_approval": False, "created_by": created_by["id"],
     }
     fields.update(overrides)
@@ -110,6 +116,7 @@ def expect_error(fn, status: int, code: str):
 
 
 def cleanup() -> None:
+    sql("DELETE FROM projects WHERE name LIKE %s", (f"check-{RUN}-%",))
     sql("DELETE FROM teams WHERE name LIKE %s", (f"check-{RUN}-%",))
     sql("DELETE FROM users WHERE email LIKE %s", (f"{RUN}-%@check.test",))
 
@@ -119,7 +126,8 @@ def cleanup() -> None:
 def check_schema():
     names = {r["table_name"] for r in sql(
         "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'")}
-    expected = {"users", "teams", "memberships", "statuses", "work_items", "activity", "idempotency_keys"}
+    expected = {"users", "teams", "memberships", "statuses", "work_items", "activity", "idempotency_keys",
+                "projects", "project_teams", "task_types"}
     assert expected <= names, f"missing tables: {expected - names}"
     rows = sql("SELECT unnest(enum_range(NULL::item_priority))::text AS p")
     assert [r["p"] for r in rows] == ["urgent", "high", "medium", "low"]
@@ -141,7 +149,7 @@ def check_password_hash_roundtrip():
 def create(u: dict, team_id, **kw) -> dict:
     from app.items import ItemCreate, create_item
 
-    data = ItemCreate(**{"team_id": team_id, "title": "Checked item", "type": "task", "priority": "medium", **kw})
+    data = ItemCreate(**{"team_id": team_id, "title": "Checked item", "type_id": type_id(team_id), "priority": "medium", **kw})
     with tx() as conn:
         return create_item(conn, u["id"], data)
 
@@ -234,7 +242,7 @@ def idem_create(u: dict, team_id, key: str | None, title: str = "Idem item"):
     from app.idempotency import request_hash, run_idempotent
     from app.items import ItemCreate, create_item
 
-    data = ItemCreate(team_id=team_id, title=title, type="task", priority="medium")
+    data = ItemCreate(team_id=team_id, title=title, type_id=type_id(team_id), priority="medium")
     h = request_hash("POST", "/api/items", data.model_dump(mode="json"))
     with tx() as conn:
         return run_idempotent(conn, u["id"], key, h, lambda: (201, create_item(conn, u["id"], data)))
@@ -560,9 +568,9 @@ def check_pages_and_has_more():
 
     t = team()
     m = user("member", t["id"])
-    sql("""INSERT INTO work_items (team_id, title, type, priority, status_id, requires_approval, created_by)
-           SELECT %s, 'Paged ' || g, 'task', 'medium', %s, false, %s FROM generate_series(1, 60) g""",
-        (t["id"], status_id(t["id"]), m["id"]))
+    sql("""INSERT INTO work_items (team_id, title, type_id, priority, status_id, requires_approval, created_by)
+           SELECT %s, 'Paged ' || g, %s, 'medium', %s, false, %s FROM generate_series(1, 60) g""",
+        (t["id"], type_id(t["id"]), status_id(t["id"]), m["id"]))
     pages = [call(list_items, m["id"], team_id=str(t["id"]), page=p, page_size=25) for p in (1, 2, 3)]
     assert [len(p["items"]) for p in pages] == [25, 25, 10]
     assert [p["has_more"] for p in pages] == [True, True, False]
@@ -677,7 +685,7 @@ def check_change_is_committed_before_response_is_sent():
     cookie = h["set-cookie"].split(";")[0]
     seen = {}
     status, _, _ = asgi(app, "POST", "/api/items",
-                        {"team_id": str(t["id"]), "title": "Commit timing", "type": "task", "priority": "low"},
+                        {"team_id": str(t["id"]), "title": "Commit timing", "type_id": str(type_id(t["id"])), "priority": "low"},
                         {"cookie": cookie, "idempotency-key": "commit-1"},
                         on_start=lambda: seen.setdefault("count", item_count(t["id"])))
     assert status == 201, status
@@ -852,11 +860,12 @@ def check_event_routing_respects_visibility():
 
 # ---- Statuses -------------------------------------------------------------
 
-def check_every_team_gets_the_three_default_statuses():
+def check_every_team_gets_the_four_default_statuses():
     t = team()
     rows = sql("SELECT name, kind, finished FROM statuses WHERE team_id = %s ORDER BY position", (t["id"],))
     assert [(r["name"], r["kind"], r["finished"]) for r in rows] == [
-        ("To do", "todo", False), ("In progress", "in_progress", False), ("Completed", "completed", True)]
+        ("To do", "todo", False), ("In progress", "in_progress", False), ("Completed", "completed", True),
+        ("Unassigned", "unassigned", False)]
 
 
 def check_leads_add_custom_statuses_members_can_only_read():
@@ -865,13 +874,13 @@ def check_leads_add_custom_statuses_members_can_only_read():
     t = team()
     lead, m = user("lead", t["id"]), user("member", t["id"])
     s_ = call(st.create_status, lead["id"], t["id"], st.StatusCreate(name="In review", color="teal"))
-    assert s_["kind"] == "custom" and s_["position"] == 4 and not s_["finished"]
+    assert s_["kind"] == "custom" and s_["position"] == 5 and not s_["finished"]
     expect_error(lambda: call(st.create_status, m["id"], t["id"], st.StatusCreate(name="Nope")), 403, "FORBIDDEN")
     expect_error(lambda: call(st.create_status, user()["id"], t["id"], st.StatusCreate(name="Nope")), 404, "NOT_FOUND")
     expect_error(lambda: call(st.create_status, lead["id"], t["id"], st.StatusCreate(name="in REVIEW")),
                  409, "STATUS_EXISTS")
     names = [x["name"] for x in call(st.list_team, m["id"], t["id"])]
-    assert names == ["To do", "In progress", "Completed", "In review"], names
+    assert names == ["To do", "In progress", "Completed", "Unassigned", "In review"], names
 
 
 def check_default_statuses_cannot_be_renamed_or_deleted():
@@ -885,6 +894,10 @@ def check_default_statuses_cannot_be_renamed_or_deleted():
     expect_error(lambda: call(st.update_status, lead["id"], t["id"], todo, st.StatusPatch(finished=True)),
                  403, "DEFAULT_STATUS")
     expect_error(lambda: call(st.delete_status, lead["id"], t["id"], todo, None), 403, "DEFAULT_STATUS")
+    unassigned = status_id(t["id"], "unassigned")
+    expect_error(lambda: call(st.update_status, lead["id"], t["id"], unassigned, st.StatusPatch(name="Limbo")),
+                 403, "DEFAULT_STATUS")
+    expect_error(lambda: call(st.delete_status, lead["id"], t["id"], unassigned, None), 403, "DEFAULT_STATUS")
     assert call(st.update_status, lead["id"], t["id"], todo, st.StatusPatch(color="red"))["color"] == "red"
 
 
@@ -898,7 +911,8 @@ def check_custom_statuses_rename_and_reorder():
     assert call(st.update_status, lead["id"], t["id"], a["id"], st.StatusPatch(name="Review"))["name"] == "Review"
     expect_error(lambda: call(st.update_status, lead["id"], t["id"], a["id"], st.StatusPatch(name="beta")),
                  409, "STATUS_EXISTS")
-    order = [status_id(t["id"], "completed"), b["id"], a["id"], status_id(t["id"], "todo"), status_id(t["id"], "in_progress")]
+    order = [status_id(t["id"], "completed"), b["id"], a["id"], status_id(t["id"], "todo"),
+             status_id(t["id"], "in_progress"), status_id(t["id"], "unassigned")]
     got = call(st.reorder, lead["id"], t["id"], order)
     assert [x["id"] for x in got] == order
     expect_error(lambda: call(st.reorder, lead["id"], t["id"], order[:-1]), 422, "INVALID_ORDER")
@@ -940,6 +954,44 @@ def check_team_move_maps_status_by_default_kind_then_name():
     assert got == {"review": "review", "lonely": "To do", "working": "In progress"}, got
     changes = sql("SELECT payload FROM activity WHERE work_item_id = %s AND kind = 'updated'", (lonely["id"],))[0]
     assert changes["payload"]["changes"]["status"] == {"from": "Only here", "to": "To do"}, changes
+
+
+def check_moving_a_task_to_unassigned_removes_its_assignee():
+    from app.items import move_item
+
+    t = team()
+    lead, m = user("lead", t["id"]), user("member", t["id"])
+    owned = item(lead, t["id"], assignee_id=m["id"], assigned_by=lead["id"])
+    out = call(move_item, owned["id"], lead["id"], status_id(t["id"], "unassigned"), 1)
+    assert out["status"]["kind"] == "unassigned" and out["assignee"] is None and out["version"] == 2, out
+    assert activity_kinds(owned["id"]) == ["status_changed", "assigned"], activity_kinds(owned["id"])
+    entry = sql("SELECT payload FROM activity WHERE work_item_id = %s AND kind = 'assigned'", (owned["id"],))[0]
+    assert entry["payload"]["from"] == str(m["id"]) and entry["payload"]["to"] is None, entry
+    nobody = item(lead, t["id"])  # nothing to remove: only the status changes
+    call(move_item, nobody["id"], lead["id"], status_id(t["id"], "unassigned"), 1)
+    assert activity_kinds(nobody["id"]) == ["status_changed"]
+    mine = item(lead, t["id"], assignee_id=m["id"], assigned_by=lead["id"])  # other moves keep the assignee
+    assert call(move_item, mine["id"], m["id"], status_id(t["id"], "in_progress"), 1)["assignee"]["id"] == m["id"]
+
+
+def check_leaving_unassigned_can_assign_in_the_same_step():
+    from app.items import move_item
+
+    t = team()
+    lead, m, other = user("lead", t["id"]), user("member", t["id"]), user()
+    unassigned, doing = status_id(t["id"], "unassigned"), status_id(t["id"], "in_progress")
+    it = item(lead, t["id"], status_id=unassigned)
+    expect_error(lambda: call(move_item, it["id"], lead["id"], doing, 1, other["id"]), 422, "INVALID_ASSIGNEE")  # not in the team
+    waiting = item(lead, t["id"])
+    expect_error(lambda: call(move_item, waiting["id"], lead["id"], unassigned, 1, m["id"]), 422, "INVALID_ASSIGNEE")  # Unassigned has no owner
+    out = call(move_item, it["id"], lead["id"], doing, 1, m["id"])
+    assert out["status"]["name"] == "In progress" and out["assignee"]["id"] == m["id"] and out["version"] == 2, out
+    assert out["assigned_by"]["id"] == lead["id"]
+    assert activity_kinds(it["id"]) == ["status_changed", "assigned"], activity_kinds(it["id"])
+    plain = item(lead, t["id"], status_id=unassigned)  # no assignee given: just moves
+    assert call(move_item, plain["id"], lead["id"], doing, 1)["assignee"] is None
+    mine = item(lead, t["id"], status="in_progress", assignee_id=m["id"], assigned_by=lead["id"])  # an assignee can't pass it on
+    expect_error(lambda: call(move_item, mine["id"], m["id"], status_id(t["id"], "completed"), 1, lead["id"]), 403, "FORBIDDEN")
 
 
 # ---- Profile --------------------------------------------------------------
@@ -1069,7 +1121,8 @@ def check_admin_routes_need_an_admin_and_signup_is_gone():
     assert call_api(app, "GET", "/api/teams")[0] == 401  # team names are no longer public
     cookie = login_cookie(app, member_u)
     for method, path in (("GET", "/api/admin/summary"), ("GET", "/api/admin/teams"), ("GET", "/api/admin/users"),
-                         ("POST", "/api/admin/teams"), ("POST", "/api/admin/users")):
+                         ("POST", "/api/admin/teams"), ("POST", "/api/admin/users"),
+                         ("GET", "/api/admin/projects"), ("POST", "/api/admin/projects")):
         status, body = call_api(app, method, path, cookie, {} if method == "POST" else None)
         assert status == 403 and body["error"]["code"] == "FORBIDDEN", (method, path, status, body)
     assert call_api(app, "GET", "/api/admin/summary", login_cookie(app, admin_u))[0] == 200
@@ -1149,7 +1202,9 @@ def check_team_lifecycle_create_rename_delete():
     name = f"check-{RUN}-lifecycle"
     t = call(create_team, TeamIn(name=name))
     kinds = [r["kind"] for r in sql("SELECT kind FROM statuses WHERE team_id = %s ORDER BY position", (t["id"],))]
-    assert kinds == ["todo", "in_progress", "completed"], kinds
+    assert kinds == ["todo", "in_progress", "completed", "unassigned"], kinds
+    assert [r["name"] for r in sql("SELECT name FROM task_types WHERE team_id = %s ORDER BY position", (t["id"],))] == [
+        "Customer issue", "Engineering", "Payment", "Incident", "Compliance", "Task"]
     expect_error(lambda: call(create_team, TeamIn(name=name)), 409, "TEAM_NAME_TAKEN")
     other = call(create_team, TeamIn(name=f"{name}-other"))
     expect_error(lambda: call(rename_team, other["id"], TeamIn(name=name)), 409, "TEAM_NAME_TAKEN")
@@ -1271,6 +1326,323 @@ def check_admin_lists_search_and_paginate():
             teams[t1["name"]]["total_tasks"], teams[t1["name"]]["open_tasks"]) == (6, 1, "Zed Lead", 2, 1), teams[t1["name"]]
     assert teams[t3["name"]]["member_count"] == 0 and teams[t3["name"]]["lead_names"] == ""
     assert call(list_teams, "%_", 1, 50)["items"] == []  # search text is not a wildcard pattern
+
+
+# ---- Projects -------------------------------------------------------------
+
+def project(*teams: dict) -> dict:
+    """A project assigned to the given teams (inserted straight into the database)."""
+    row = sql("INSERT INTO projects (name) VALUES (%s) RETURNING *", (f"check-{RUN}-p{_next()}",))[0]
+    for t in teams:
+        sql("INSERT INTO project_teams (project_id, team_id) VALUES (%s, %s)", (row["id"], t["id"]))
+    return row
+
+
+def task_state(task_id) -> dict:
+    return sql("""SELECT w.project_id, w.version, s.kind AS status_kind FROM work_items w
+                  JOIN statuses s ON s.id = w.status_id WHERE w.id = %s""", (task_id,))[0]
+
+
+def check_project_admin_api_lifecycle_and_admin_only():
+    app = api_app()
+    t = team()
+    admin_u, member_u = make_admin(), user("member", t["id"])
+    member, admin_c = login_cookie(app, member_u), login_cookie(app, admin_u)
+    name = f"check-{RUN}-api"
+    assert call_api(app, "GET", "/api/admin/projects")[0] == 401
+    for method, path, body in (("GET", "/api/admin/projects", None), ("POST", "/api/admin/projects", {"name": name}),
+                               ("PATCH", f"/api/admin/projects/{uuid.uuid4()}", {"name": "x"}),
+                               ("DELETE", f"/api/admin/projects/{uuid.uuid4()}", {"confirm_name": "x"}),
+                               ("GET", f"/api/admin/projects/{uuid.uuid4()}/teams", None),
+                               ("PUT", f"/api/admin/projects/{uuid.uuid4()}/teams/{t['id']}", None),
+                               ("DELETE", f"/api/admin/projects/{uuid.uuid4()}/teams/{t['id']}", None)):
+        status, out = call_api(app, method, path, member, body)
+        assert status == 403 and out["error"]["code"] == "FORBIDDEN", (method, path, status, out)
+    status, p = call_api(app, "POST", "/api/admin/projects", admin_c, {"name": f"  {name} ", "description": "Launch"})
+    assert status == 201 and p["name"] == name and p["team_count"] == 0, (status, p)
+    assert call_api(app, "POST", "/api/admin/projects", admin_c, {"name": name.upper()})[1]["error"]["code"] == "PROJECT_NAME_TAKEN"
+    assert call_api(app, "POST", "/api/admin/projects", admin_c, {"name": "  "})[0] == 400
+    assert call_api(app, "PATCH", f"/api/admin/projects/{p['id']}", admin_c, {"description": "New"})[1]["description"] == "New"
+    assert call_api(app, "PATCH", f"/api/admin/projects/{p['id']}", admin_c, {})[0] == 400
+    assert call_api(app, "PUT", f"/api/admin/projects/{p['id']}/teams/{t['id']}", admin_c)[0] == 200
+    assert call_api(app, "PUT", f"/api/admin/projects/{p['id']}/teams/{t['id']}", admin_c)[0] == 200  # repeating is harmless
+    from app.projects import list_projects
+
+    assert call_api(app, "GET", "/api/admin/projects", admin_c)[0] == 200
+    listed = call(list_projects, RUN, 1, 50)["items"]
+    assert [(x["name"], x["team_count"], [y["name"] for y in x["teams"]]) for x in listed] == [(name, 1, [t["name"]])], listed
+    mine = {x["id"]: x for x in call_api(app, "GET", f"/api/admin/projects/{p['id']}/teams", admin_c)[1]}
+    assert mine[str(t["id"])]["assigned"] is True
+    assert call_api(app, "DELETE", f"/api/admin/projects/{p['id']}/teams/{t['id']}", admin_c)[1]["released"] == 0
+    assert call_api(app, "GET", "/api/admin/projects/not-an-id/teams", admin_c)[0] == 404
+    assert call_api(app, "DELETE", f"/api/admin/projects/{p['id']}", admin_c, {"confirm_name": "wrong"})[0] == 422
+    assert call_api(app, "DELETE", f"/api/admin/projects/{p['id']}", admin_c, {"confirm_name": name})[0] == 204
+    assert sql("SELECT 1 FROM projects WHERE id = %s", (p["id"],)) == []
+
+
+def check_project_names_are_unique_ignoring_case():
+    from app.projects import ProjectIn, ProjectPatch, create_project, update_project
+
+    one = call(create_project, ProjectIn(name=f"check-{RUN}-Alpha"))
+    two = call(create_project, ProjectIn(name=f"check-{RUN}-Beta"))
+    expect_error(lambda: call(create_project, ProjectIn(name=f"CHECK-{RUN}-alpha")), 409, "PROJECT_NAME_TAKEN")
+    expect_error(lambda: call(update_project, two["id"], ProjectPatch(name=f"check-{RUN}-ALPHA")), 409, "PROJECT_NAME_TAKEN")
+    assert call(update_project, one["id"], ProjectPatch(name=f"check-{RUN}-ALPHA"))["name"] == f"check-{RUN}-ALPHA"
+    expect_error(lambda: call(update_project, uuid.uuid4(), ProjectPatch(name="x")), 404, "NOT_FOUND")
+
+
+def check_a_task_can_only_carry_a_project_of_its_own_team():
+    from app.items import update_item
+
+    a, b = team(), team()
+    m = user("member", a["id"])
+    mine, theirs = project(a), project(b)
+    expect_error(lambda: create(m, a["id"], project_id=theirs["id"]), 422, "INVALID_PROJECT")
+    expect_error(lambda: create(m, a["id"], project_id=uuid.uuid4()), 422, "INVALID_PROJECT")
+    it = create(m, a["id"], project_id=mine["id"])
+    assert it["project"] == {"id": mine["id"], "name": mine["name"]}, it["project"]
+    plain = create(m, a["id"])
+    assert plain["project"] is None
+    expect_error(lambda: call(update_item, plain["id"], m["id"], 1, {"project_id": theirs["id"]}), 422, "INVALID_PROJECT")
+    tagged = call(update_item, plain["id"], m["id"], 1, {"project_id": mine["id"]})  # the creator tags it later
+    assert tagged["project"]["name"] == mine["name"] and tagged["version"] == 2
+    entry = sql("SELECT payload FROM activity WHERE work_item_id = %s AND kind = 'updated'", (plain["id"],))[0]
+    assert entry["payload"]["changes"]["project"] == {"from": None, "to": mine["name"]}, entry
+    cleared = call(update_item, plain["id"], m["id"], 2, {"project_id": None})
+    assert cleared["project"] is None and cleared["version"] == 3
+    assert call(update_item, plain["id"], m["id"], 3, {"project_id": None})["version"] == 3  # nothing changed
+
+
+def check_taking_a_team_off_a_project_releases_its_tasks_to_unassigned():
+    from app.projects import remove_team
+
+    a, b = team(), team()
+    admin_u = make_admin()
+    lead_a, lead_b = user("lead", a["id"]), user("lead", b["id"])
+    p = project(a, b)
+    todo = item(lead_a, a["id"], project_id=p["id"])
+    doing = item(lead_a, a["id"], status="in_progress", project_id=p["id"])
+    done = item(lead_a, a["id"], status="completed", project_id=p["id"])
+    waiting = item(lead_a, a["id"], project_id=p["id"], requires_approval=True, approval="pending")
+    rejected = item(lead_a, a["id"], project_id=p["id"], requires_approval=True, approval="rejected")
+    other_team = item(lead_b, b["id"], project_id=p["id"])
+    untagged = item(lead_a, a["id"])
+    out = call(remove_team, admin_u["id"], p["id"], a["id"])
+    assert out["released"] == 5 and out["assigned"] is False, out
+    for moved in (todo, doing):
+        got = task_state(moved["id"])
+        assert (got["project_id"], got["status_kind"], got["version"]) == (None, "unassigned", 2), got
+        assert sorted(activity_kinds(moved["id"])) == ["status_changed", "updated"], activity_kinds(moved["id"])
+    log = sql("SELECT actor_id, payload FROM activity WHERE work_item_id = %s AND kind = 'status_changed'", (doing["id"],))[0]
+    assert log["actor_id"] == admin_u["id"] and log["payload"]["from"] == "In progress" \
+        and log["payload"]["to"] == "Unassigned" and log["payload"]["reason"] == "Project changed", log
+    change = sql("SELECT payload FROM activity WHERE work_item_id = %s AND kind = 'updated'", (todo["id"],))[0]
+    assert change["payload"]["changes"]["project"] == {"from": p["name"], "to": None}, change
+    for stays, kind in ((done, "completed"), (waiting, "todo"), (rejected, "todo")):  # untagged, status left alone
+        got = task_state(stays["id"])
+        assert (got["project_id"], got["status_kind"], got["version"]) == (None, kind, 2), (kind, got)
+        assert activity_kinds(stays["id"]) == ["updated"]
+    assert task_state(other_team["id"])["project_id"] == p["id"] and task_state(other_team["id"])["version"] == 1
+    assert task_state(untagged["id"])["version"] == 1
+    assert sql("SELECT count(*) AS n FROM work_items WHERE team_id = %s", (a["id"],))[0]["n"] == 6  # nothing deleted
+    assert [r["team_id"] for r in sql("SELECT team_id FROM project_teams WHERE project_id = %s", (p["id"],))] == [b["id"]]
+    assert call(remove_team, admin_u["id"], p["id"], a["id"])["released"] == 0  # repeating releases nothing
+
+
+def check_deleting_a_project_releases_every_teams_tasks():
+    from app.projects import ProjectDelete, delete_project
+
+    a, b = team(), team()
+    admin_u = make_admin()
+    la, lb = user("lead", a["id"]), user("lead", b["id"])
+    p = project(a, b)
+    one, two = item(la, a["id"], project_id=p["id"]), item(lb, b["id"], status="completed", project_id=p["id"])
+    expect_error(lambda: call(delete_project, admin_u["id"], p["id"], ProjectDelete(confirm_name="nope")), 422, "CONFIRM_MISMATCH")
+    assert sql("SELECT 1 FROM projects WHERE id = %s", (p["id"],))
+    call(delete_project, admin_u["id"], p["id"], ProjectDelete(confirm_name=f" {p['name']}"))
+    assert sql("SELECT 1 FROM projects WHERE id = %s", (p["id"],)) == []
+    assert sql("SELECT 1 FROM project_teams WHERE project_id = %s", (p["id"],)) == []
+    assert (task_state(one["id"])["project_id"], task_state(one["id"])["status_kind"]) == (None, "unassigned")
+    assert (task_state(two["id"])["project_id"], task_state(two["id"])["status_kind"]) == (None, "completed")
+    assert sorted(activity_kinds(one["id"])) == ["status_changed", "updated"] and activity_kinds(two["id"]) == ["updated"]
+
+
+def check_moving_a_task_drops_a_project_the_new_team_is_not_on():
+    from app.items import update_item
+
+    a, b, c = team(), team(), team()
+    lead = user("lead", a["id"])
+    p = project(a, b)
+    keeps, loses = item(lead, a["id"], project_id=p["id"]), item(lead, a["id"], project_id=p["id"])
+    assert call(update_item, keeps["id"], lead["id"], 1, {"team_id": b["id"]})["project"]["name"] == p["name"]
+    moved = call(update_item, loses["id"], lead["id"], 1, {"team_id": c["id"]})
+    assert moved["project"] is None
+    entry = sql("SELECT payload FROM activity WHERE work_item_id = %s AND kind = 'updated'", (loses["id"],))[0]
+    assert entry["payload"]["changes"]["project"] == {"from": p["name"], "to": None}, entry
+    plain = item(lead, a["id"])  # asking for a project the destination team isn't on is refused
+    expect_error(lambda: call(update_item, plain["id"], lead["id"], 1, {"team_id": c["id"], "project_id": p["id"]}),
+                 422, "INVALID_PROJECT")
+
+
+def check_project_filter_on_lists_and_board_counts():
+    from app.listing import list_items, status_counts
+
+    t = team()
+    lead = user("lead", t["id"])
+    p, q = project(t), project(t)
+    in_p = [item(lead, t["id"], project_id=p["id"]), item(lead, t["id"], status="completed", project_id=p["id"])]
+    in_q = item(lead, t["id"], project_id=q["id"])
+    none_ = item(lead, t["id"])
+
+    def ids(**kw):
+        return {i["id"] for i in call(list_items, lead["id"], team_id=str(t["id"]), **kw)["items"]}
+
+    assert ids(project=str(p["id"])) == {i["id"] for i in in_p}
+    assert ids(project=str(q["id"])) == {in_q["id"]}
+    assert ids(project="none") == {none_["id"]}
+    assert len(ids()) == 4
+    got = call(list_items, lead["id"], team_id=str(t["id"]), project=str(q["id"]))["items"][0]
+    assert got["project"] == {"id": q["id"], "name": q["name"]}
+    counts = call(status_counts, lead["id"], team_id=str(t["id"]), project=str(p["id"]))
+    assert counts == {str(status_id(t["id"], "todo")): 1, str(status_id(t["id"], "completed")): 1}, counts
+    assert call(status_counts, lead["id"], team_id=str(t["id"]), project="none") == {str(status_id(t["id"], "todo")): 1}
+    expect_error(lambda: call(list_items, lead["id"], project="not-an-id"), 400, "INVALID_FILTER")
+    outsider = user()  # filtering by a project never widens what a person may see
+    assert call(list_items, outsider["id"], project=str(p["id"]))["items"] == []
+
+
+def check_people_only_see_projects_of_their_own_teams_or_a_team_they_send_work_to():
+    from app.projects import for_user, list_visible
+
+    a, b = team(), team()
+    m = user("member", a["id"])
+    pa, pb = project(a), project(b)
+    mine = [x["id"] for x in call(list_visible, m["id"], None)]
+    assert pa["id"] in mine and pb["id"] not in mine
+    assert [x["id"] for x in call(list_visible, m["id"], str(b["id"]))] == [pb["id"]]  # sending a task to team b
+    own = call(for_user, m["id"])
+    assert [x["id"] for x in own[str(a["id"])]] == [pa["id"]] and str(b["id"]) not in own
+    expect_error(lambda: call(list_visible, m["id"], "nope"), 404, "NOT_FOUND")
+
+
+def check_migration_adds_unassigned_to_teams_that_lack_it():
+    from app.migrate import PROJECT_STATEMENTS
+
+    t = team()
+    sql("DELETE FROM statuses WHERE team_id = %s AND kind = 'unassigned'", (t["id"],))
+    custom_status(t["id"], "unassigned")  # a team's own status with the clashing name
+
+    def run():
+        with tx() as conn:
+            for stmt in PROJECT_STATEMENTS[-2:]:
+                conn.execute(stmt)
+
+    run()
+    run()  # safe to repeat
+    rows = sql("SELECT name, kind, finished FROM statuses WHERE team_id = %s ORDER BY position", (t["id"],))
+    assert [(r["name"], r["kind"], r["finished"]) for r in rows] == [
+        ("To do", "todo", False), ("In progress", "in_progress", False), ("Completed", "completed", True),
+        ("unassigned (custom)", "custom", False), ("Unassigned", "unassigned", False)], rows
+
+
+# ---- Task types -----------------------------------------------------------
+
+def check_types_leads_and_admins_manage_members_only_read():
+    from app import task_types as tt
+
+    t = team()
+    lead, m, outsider = user("lead", t["id"]), user("member", t["id"]), user()
+    admin_u = make_admin()
+    assert [x["name"] for x in call(tt.list_team, t["id"])] == [
+        "Customer issue", "Engineering", "Payment", "Incident", "Compliance", "Task"]
+    made = call(tt.create_type, lead, t["id"], tt.TypeIn(name="  Research "))
+    assert made["name"] == "Research" and made["position"] == 7, made
+    expect_error(lambda: call(tt.create_type, lead, t["id"], tt.TypeIn(name="research")), 409, "TYPE_EXISTS")
+    expect_error(lambda: call(tt.create_type, m, t["id"], tt.TypeIn(name="Nope")), 403, "FORBIDDEN")
+    expect_error(lambda: call(tt.create_type, outsider, t["id"], tt.TypeIn(name="Nope")), 404, "NOT_FOUND")
+    assert call(tt.create_type, admin_u, t["id"], tt.TypeIn(name="By admin"))["name"] == "By admin"  # admins need not be members
+    assert call(tt.rename_type, lead, t["id"], made["id"], tt.TypeIn(name="Discovery"))["name"] == "Discovery"
+    expect_error(lambda: call(tt.rename_type, lead, t["id"], made["id"], tt.TypeIn(name="payment")), 409, "TYPE_EXISTS")
+    expect_error(lambda: call(tt.rename_type, m, t["id"], made["id"], tt.TypeIn(name="X")), 403, "FORBIDDEN")
+    expect_error(lambda: call(tt.rename_type, lead, t["id"], uuid.uuid4(), tt.TypeIn(name="X")), 404, "NOT_FOUND")
+    expect_error(lambda: call(tt.list_team, uuid.uuid4()), 404, "NOT_FOUND")
+
+
+def check_types_any_default_can_go_but_never_the_last_and_tasks_must_move():
+    from app import task_types as tt
+
+    t = team()
+    lead, m = user("lead", t["id"]), user("member", t["id"])
+    incident, task = type_id(t["id"], "Incident"), type_id(t["id"], "Task")
+    one, two = item(m, t["id"], type_id=incident), item(m, t["id"], type_id=incident)
+    err = expect_error(lambda: call(tt.delete_type, lead, t["id"], incident, None), 409, "TYPE_IN_USE")
+    assert err.details["task_count"] == 2
+    expect_error(lambda: call(tt.delete_type, lead, t["id"], incident, incident), 422, "INVALID_TYPE")
+    expect_error(lambda: call(tt.delete_type, m, t["id"], incident, task), 403, "FORBIDDEN")
+    call(tt.delete_type, lead, t["id"], incident, task)
+    for it in (one, two):
+        row = sql("SELECT type_id, version FROM work_items WHERE id = %s", (it["id"],))[0]
+        assert (row["type_id"], row["version"]) == (task, 2), row
+        entry = sql("SELECT payload FROM activity WHERE work_item_id = %s AND kind = 'updated'", (it["id"],))[0]
+        assert entry["payload"]["changes"]["type"] == {"from": "Incident", "to": "Task"}, entry
+    assert sql("SELECT 1 FROM task_types WHERE id = %s", (incident,)) == []
+    for name in ("Customer issue", "Engineering", "Payment", "Compliance"):  # unused defaults go freely
+        call(tt.delete_type, lead, t["id"], type_id(t["id"], name), None)
+    expect_error(lambda: call(tt.delete_type, lead, t["id"], task, None), 409, "LAST_TYPE")
+
+
+def check_a_task_takes_only_a_type_of_its_own_team_and_types_follow_a_team_move():
+    from app.items import update_item
+
+    a, b = team(), team()
+    lead = user("lead", a["id"])
+    sql("UPDATE task_types SET name = 'Chore' WHERE id = %s", (type_id(b["id"], "Task"),))  # b has no "Task"
+    expect_error(lambda: create(lead, a["id"], type_id=type_id(b["id"], "Payment")), 422, "INVALID_TYPE")
+    expect_error(lambda: create(lead, a["id"], type_id=uuid.uuid4()), 422, "INVALID_TYPE")
+    it = create(lead, a["id"], type_id=type_id(a["id"], "Payment"))
+    assert it["type"] == {"id": type_id(a["id"], "Payment"), "name": "Payment"}, it["type"]
+    edited = call(update_item, it["id"], lead["id"], 1, {"type_id": type_id(a["id"], "Incident")})
+    assert edited["type"]["name"] == "Incident" and edited["version"] == 2
+    entry = sql("SELECT payload FROM activity WHERE work_item_id = %s AND kind = 'updated'", (it["id"],))[0]
+    assert entry["payload"]["changes"]["type"] == {"from": "Payment", "to": "Incident"}, entry
+    expect_error(lambda: call(update_item, it["id"], lead["id"], 2, {"type_id": type_id(b["id"], "Payment")}), 422, "INVALID_TYPE")
+    moved = call(update_item, it["id"], lead["id"], 2, {"team_id": b["id"]})  # b has an Incident too
+    assert moved["type"]["name"] == "Incident" and moved["type"]["id"] == type_id(b["id"], "Incident")
+    odd = create(lead, a["id"], type_id=type_id(a["id"], "Task"))  # b has no "Task": lands on b's first type
+    got = call(update_item, odd["id"], lead["id"], 1, {"team_id": b["id"]})
+    assert got["type"]["name"] == "Customer issue", got["type"]
+
+
+def check_type_filter_matches_by_name_and_lists_carry_the_type():
+    from app.listing import list_items
+
+    t = team()
+    lead = user("lead", t["id"])
+    inc, pay = item(lead, t["id"], type_id=type_id(t["id"], "Incident")), item(lead, t["id"], type_id=type_id(t["id"], "Payment"))
+    got = call(list_items, lead["id"], team_id=str(t["id"]), type=["incident"])["items"]
+    assert [i["id"] for i in got] == [inc["id"]] and got[0]["type"]["name"] == "Incident", got
+    both = call(list_items, lead["id"], team_id=str(t["id"]), type=["Incident", "payment"])["items"]
+    assert {i["id"] for i in both} == {inc["id"], pay["id"]}
+    assert call(list_items, lead["id"], team_id=str(t["id"]), type=["nonsense"])["items"] == []
+
+
+def check_types_api_and_me():
+    app = api_app()
+    t = team()
+    lead, m = user("lead", t["id"]), user("member", t["id"])
+    lead_c, member_c = login_cookie(app, lead), login_cookie(app, m)
+    assert call_api(app, "GET", f"/api/teams/{t['id']}/types")[0] == 401
+    status, listed = call_api(app, "GET", f"/api/teams/{t['id']}/types", member_c)
+    assert status == 200 and len(listed) == 6, (status, listed)
+    assert call_api(app, "POST", f"/api/teams/{t['id']}/types", member_c, {"name": "X"})[0] == 403
+    status, made = call_api(app, "POST", f"/api/teams/{t['id']}/types", lead_c, {"name": "Research"})
+    assert status == 201 and made["name"] == "Research"
+    assert call_api(app, "PATCH", f"/api/teams/{t['id']}/types/{made['id']}", lead_c, {"name": "Study"})[1]["name"] == "Study"
+    assert call_api(app, "POST", f"/api/teams/{t['id']}/types", lead_c, {"name": "  "})[0] == 400
+    assert call_api(app, "DELETE", f"/api/teams/{t['id']}/types/{made['id']}", lead_c)[0] == 204
+    me = call_api(app, "GET", "/api/me", member_c)[1]
+    assert [x["name"] for x in me["teams"][0]["types"]] == [
+        "Customer issue", "Engineering", "Payment", "Incident", "Compliance", "Task"]
 
 
 # ---- runner ---------------------------------------------------------------
